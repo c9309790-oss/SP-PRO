@@ -1,0 +1,23 @@
+idf_component_register(
+    SRCS 
+        "src/opus_player.c"
+        "src/opus_player_audio.c"
+        "src/opus_player_storage.c"
+    INCLUDE_DIRS 
+        "include"
+    REQUIRES
+        esp_http_client
+        esp_wifi
+        nvs_flash
+        esp_event
+        driver
+        log
+        freertos
+        fatfs
+        spiffs
+        json
+        mbedtls
+        esp_timer
+        espressif__esp_codec_dev
+        espressif__esp_audio_codec
+)
