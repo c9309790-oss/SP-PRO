@@ -2,11 +2,13 @@
 #include "sp_pro_app_types.h"
 #include "sp_pro_app_ctrl.h"
 #include "sp_pro_app_state.h"
+#include "sp_pro_build_flags.h"
 #include <string.h>
 #include <stddef.h>
 #include "esp_log.h"
 #include "device_statistics_store.h"
 #include "drink_record_service.h"
+#include "extraction_curve_service.h"
 
 static const char *TAG = "state_drink";
 static const uint32_t STEAM_TAIL_SPRAY_DELAY_TICKS = STAY_TICKS_15S;
@@ -20,6 +22,11 @@ static const float GRIND_RESUME_MIN_REMAIN_G = 1.0f;
 static const float WATER_DISPLAY_FLOW_MIN_ML_S = 0.02f;
 static const float WATER_DISPLAY_FLOW_MAX_ML_S = 6.0f;
 static const float WATER_DISPLAY_FLOW_ALPHA = 0.25f;
+static const float WATER_COUNTER_RESET_REBASE_THRESHOLD_ML = 20.0f;
+static const float DRINK_COUNTER_RESET_REBASE_THRESHOLD_ML = 2.0f;
+static const float DRINK_COUNTER_RESET_NEAR_ZERO_ML = 2.0f;
+static const float DRINK_SELF_ABORT_NO_OUTPUT_MAX_ML = 0.5f;
+static const uint32_t DRINK_CANCEL_RETRY_TICKS = STAY_TICKS(300);
 
 static inline void ui_anim_start_preheat(app_ctx_t *ctx);
 static inline void ui_anim_stop_preheat(app_ctx_t *ctx);
@@ -30,13 +37,22 @@ static void drink_capture_liquid_session_base(app_ctx_t *ctx);
 static bool drink_local_target_reached(app_ctx_t *ctx, const char *label);
 static void drink_water_display_reset(app_ctx_t *ctx);
 static void drink_water_capture_start_snapshot(app_ctx_t *ctx);
+static bool drink_water_rebase_if_counter_reset(app_ctx_t *ctx, const char *label);
+static bool drink_rebase_if_counter_reset(app_ctx_t *ctx, const char *label);
 static bool drink_water_ready_for_new_session(app_ctx_t *ctx);
 static void drink_water_restart(app_ctx_t *ctx);
 static void drink_water_display_update(app_ctx_t *ctx);
+static control_action_t drink_stop_action_for(drink_type_t drink);
 static void drink_clear_finish_wait(app_ctx_t *ctx);
 static bool drink_brew_finish_confirmed(app_ctx_t *ctx, const char *label);
+static bool drink_controller_self_abort_confirmed(app_ctx_t *ctx, const char *label);
+static bool drink_handle_cancel_pending(app_ctx_t *ctx, const char *label);
 static void drink_enter_remote_countdown(app_ctx_t *ctx, bool water_stage);
 static const char *steam_flag_name(uint8_t steam_flag);
+static bool drink_supports_parallel_steam(const app_ctx_t *ctx);
+static void drink_clear_parallel_steam(app_ctx_t *ctx);
+static bool drink_start_parallel_steam(app_ctx_t *ctx);
+static void drink_promote_parallel_steam(app_ctx_t *ctx);
 static float drink_grind_remaining_g(const app_ctx_t *ctx);
 
 static bool drink_is_remote_flow(const app_ctx_t *ctx)
@@ -137,6 +153,7 @@ static bool drink_start_remote_action(app_ctx_t *ctx,
 
     device_statistics_notify_remote_action_start(action, &ctx->ctrl.remote_formula);
     drink_record_notify_remote_action_start(action, &ctx->ctrl.remote_formula);
+    extraction_curve_notify_remote_action_start(action, &ctx->ctrl.remote_formula);
     ctx->state_runtime.drink.remote_action_started = true;
     ctx->state_runtime.drink.liquid_output_seen = false;
     ctx->state_runtime.drink.liquid_session_base_ml = ctx->ms.liquid_weight;
@@ -201,15 +218,19 @@ static inline void drink_reset_runtime(app_ctx_t *ctx)
     ctx->state_runtime.drink.grind_notice_pause_sent = false;
     ctx->state_runtime.drink.grind_resume_pending = false;
     ctx->state_runtime.drink.americano_water_started = false;
+    ctx->state_runtime.drink.force_target_display_active = false;
     ctx->state_runtime.drink.liquid_output_seen = false;
     ctx->state_runtime.drink.finish_wait_none_started = false;
+    ctx->state_runtime.drink.cancel_pending_ignore_flow = false;
     ctx->state_runtime.drink.water_idle_seen_after_start = false;
     ctx->state_runtime.drink.grind_resume_remaining_g = 0.0f;
     ctx->state_runtime.drink.liquid_session_base_ml = ctx->ms.liquid_weight;
     ctx->state_runtime.drink.display_liquid_base_ml = 0.0f;
     ctx->state_runtime.drink.display_liquid_ml = 0.0f;
     ctx->state_runtime.drink.display_flow_rate_ml_s = 0.0f;
+    ctx->state_runtime.drink.force_target_display_ml = 0.0f;
     ctx->state_runtime.drink.water_start_liquid_ml = 0.0f;
+    ctx->state_runtime.drink.target_display_cap_tick = 0U;
     ctx->state_runtime.drink.grind_resume_pause_tick = 0U;
     ctx->state_runtime.drink.finish_wait_tick = 0U;
     ctx->state_runtime.drink.last_encoder_evt_seq = ctx->ms.encoder.evt_seq;
@@ -217,6 +238,8 @@ static inline void drink_reset_runtime(app_ctx_t *ctx)
     ctx->state_runtime.drink.last_steam_log_sec = 0xFFFFFFFFU;
     ctx->state_runtime.drink.last_steam_flag = 0xFFU;
     ctx->state_runtime.drink.water_start_hot_flag = 0U;
+    ctx->state_runtime.drink.parallel_steam_active = false;
+    ctx->state_runtime.drink.parallel_steam_start_tick = 0U;
     ctx->state_runtime.drink.exit_reason = DRINK_EXIT_NONE;
 }
 
@@ -256,7 +279,10 @@ static bool drink_local_target_reached(app_ctx_t *ctx, const char *label)
     raw_progress = sp_pro_get_raw_liquid_progress_ml(ctx);
     display_progress = sp_pro_get_display_liquid_ml(ctx);
     comp = sp_pro_get_active_liquid_compensation(ctx);
-    stop_threshold = (float)ctx->drink.target_ml + comp.display_offset_ml - comp.stop_ahead_ml;
+    /* Keep display compensation and stop compensation independent.
+     * display_offset_ml only affects what the user sees on screen.
+     * stop_ahead_ml only affects when we stop the flow. */
+    stop_threshold = (float)ctx->drink.target_ml - comp.stop_ahead_ml;
     if (stop_threshold < 0.0f) {
         stop_threshold = 0.0f;
     }
@@ -265,11 +291,12 @@ static bool drink_local_target_reached(app_ctx_t *ctx, const char *label)
         (display_progress > 0.1f || ctx->ms.flow_rate > WATER_DISPLAY_FLOW_MIN_ML_S)) {
         ctx->state_runtime.drink.liquid_output_seen = true;
         ESP_LOGI(TAG,
-                 "%s first compensated liquid raw=%.1f display=%.1f target=%u offset=%.1f stopAhead=%.1f",
+                 "%s first compensated liquid raw=%.1f display=%.1f target=%u scale=%.3f offset=%.1f stopAhead=%.1f",
                  label ? label : "DRINK",
                  raw_progress,
                  display_progress,
                  (unsigned)ctx->drink.target_ml,
+                 comp.display_scale,
                  comp.display_offset_ml,
                  comp.stop_ahead_ml);
     }
@@ -279,13 +306,22 @@ static bool drink_local_target_reached(app_ctx_t *ctx, const char *label)
     }
 
     if (raw_progress >= stop_threshold) {
+        ctx->state_runtime.drink.force_target_display_active = true;
+        ctx->state_runtime.drink.force_target_display_ml = (float)ctx->drink.target_ml;
+        if (ctx->core.state == ST_WATER ||
+            (ctx->core.state == ST_AMERICANO &&
+             (ctx->core.substate == BREW_SUB_RUNNING_2 ||
+              ctx->core.substate == BREW_SUB_FINISH))) {
+            ctx->state_runtime.drink.display_liquid_ml = (float)ctx->drink.target_ml;
+        }
         ESP_LOGI(TAG,
-                 "%s local target reached raw=%.1f display=%.1f target=%u stop_threshold=%.1f offset=%.1f stopAhead=%.1f",
+                 "%s local target reached raw=%.1f display=%.1f target=%u stop_threshold=%.1f scale=%.3f offset=%.1f stopAhead=%.1f",
                  label ? label : "DRINK",
                  raw_progress,
                  display_progress,
                  (unsigned)ctx->drink.target_ml,
                  stop_threshold,
+                 comp.display_scale,
                  comp.display_offset_ml,
                  comp.stop_ahead_ml);
         return true;
@@ -352,6 +388,73 @@ static void drink_water_capture_start_snapshot(app_ctx_t *ctx)
     ctx->state_runtime.drink.water_start_hot_flag = (uint8_t)ctx->ms.hot_water_flg;
     ctx->state_runtime.drink.water_start_liquid_ml = ctx->ms.liquid_weight;
     ctx->state_runtime.drink.water_idle_seen_after_start = (ctx->ms.hot_water_flg == 0U);
+}
+
+static bool drink_water_rebase_if_counter_reset(app_ctx_t *ctx, const char *label)
+{
+    float current_liquid;
+    float session_drop;
+    float display_drop;
+
+    if (!ctx) {
+        return false;
+    }
+
+    current_liquid = ctx->ms.liquid_weight;
+    session_drop = ctx->state_runtime.drink.liquid_session_base_ml - current_liquid;
+    display_drop = ctx->state_runtime.drink.display_liquid_base_ml - current_liquid;
+
+    if (session_drop < WATER_COUNTER_RESET_REBASE_THRESHOLD_ML &&
+        display_drop < WATER_COUNTER_RESET_REBASE_THRESHOLD_ML) {
+        return false;
+    }
+
+    ESP_LOGW(TAG,
+             "%s liquid counter reset detected, rebase session %.1f->%.1f display %.1f->%.1f",
+             label ? label : "WATER",
+             ctx->state_runtime.drink.liquid_session_base_ml,
+             current_liquid,
+             ctx->state_runtime.drink.display_liquid_base_ml,
+             current_liquid);
+
+    ctx->state_runtime.drink.liquid_session_base_ml = current_liquid;
+    ctx->state_runtime.drink.display_liquid_base_ml = current_liquid;
+    ctx->state_runtime.drink.display_liquid_ml = 0.0f;
+    ctx->state_runtime.drink.display_flow_rate_ml_s = 0.0f;
+    ctx->state_runtime.drink.liquid_output_seen = false;
+    return true;
+}
+
+static bool drink_rebase_if_counter_reset(app_ctx_t *ctx, const char *label)
+{
+    float current_liquid;
+    float old_base;
+    float drop;
+
+    if (!ctx) {
+        return false;
+    }
+
+    current_liquid = ctx->ms.liquid_weight;
+    old_base = ctx->state_runtime.drink.liquid_session_base_ml;
+    drop = old_base - current_liquid;
+
+    if (drop < DRINK_COUNTER_RESET_REBASE_THRESHOLD_ML) {
+        return false;
+    }
+
+    if (current_liquid > DRINK_COUNTER_RESET_NEAR_ZERO_ML &&
+        drop < WATER_COUNTER_RESET_REBASE_THRESHOLD_ML) {
+        return false;
+    }
+
+    ctx->state_runtime.drink.liquid_session_base_ml = current_liquid;
+    ESP_LOGW(TAG,
+             "%s liquid counter reset detected, rebase session %.1f->%.1f",
+             label ? label : "DRINK",
+             old_base,
+             current_liquid);
+    return true;
 }
 
 static bool drink_water_ready_for_new_session(app_ctx_t *ctx)
@@ -443,10 +546,7 @@ static void drink_water_display_update(app_ctx_t *ctx)
     }
 
     comp = sp_pro_get_active_liquid_compensation(ctx);
-    display = raw_progress - comp.display_offset_ml;
-    if (display < 0.0f) {
-        display = 0.0f;
-    }
+    display = sp_pro_apply_liquid_display_compensation(raw_progress, comp);
 
     ctx->state_runtime.drink.display_liquid_ml = display;
 }
@@ -554,9 +654,6 @@ static inline void drink_enter_running(app_ctx_t *ctx, brew_substate_t substate)
     ctx->drink.start_tick = ctx->timer.tick;
     ctx->core.substate = substate;
     ui_anim_stop_preheat(ctx);
-    if (!drink_is_remote_flow(ctx)) {
-        drink_capture_liquid_session_base(ctx);
-    }
     drink_clear_finish_wait(ctx);
 }
 
@@ -565,6 +662,38 @@ static inline void drink_enter_finish(app_ctx_t *ctx, control_action_t stop_acti
     ctx->drink.finish_tick = ctx->timer.tick;
     ctx->core.substate = BREW_SUB_FINISH;
     ctr_cmd_action(stop_action, NULL);
+}
+
+static void drink_enter_cancel_pending(app_ctx_t *ctx)
+{
+    control_action_t stop_action;
+    bool cancel_during_prepare;
+
+    if (!ctx) {
+        return;
+    }
+
+    stop_action = drink_stop_action_for(ctx->drink.target_drink);
+    cancel_during_prepare =
+        (ctx->core.substate == BREW_SUB_PREPARE ||
+         ctx->core.substate == BREW_SUB_REMOTE_COUNTDOWN) &&
+        !ctx->state_runtime.drink.liquid_output_seen;
+    ctx->state_runtime.drink.exit_reason = DRINK_EXIT_CANCEL;
+    ctx->state_runtime.drink.cancel_pending_ignore_flow = cancel_during_prepare;
+    ctx->core.substate = BREW_SUB_CANCEL_PENDING;
+    ctx->drink.target_time = ctx->timer.tick;
+    ui_anim_stop_preheat(ctx);
+    drink_clear_finish_wait(ctx);
+    ctr_cmd_action(stop_action, NULL);
+    ESP_LOGI(TAG,
+             "Enter cancel pending ignore_flow=%d making=%u hot_water=%u grind=%u steam=%s flow=%.2f liquid=%.1f",
+             cancel_during_prepare ? 1 : 0,
+             (unsigned)ctx->ms.drink_making_flg,
+             (unsigned)ctx->ms.hot_water_flg,
+             (unsigned)ctx->ms.grind_run_flg,
+             steam_flag_name((uint8_t)ctx->ms.steam_flag),
+             ctx->ms.flow_rate,
+             ctx->ms.liquid_weight);
 }
 
 static inline bool drink_finish_delay_done(app_ctx_t *ctx)
@@ -580,6 +709,88 @@ static void drink_clear_finish_wait(app_ctx_t *ctx)
 
     ctx->state_runtime.drink.finish_wait_none_started = false;
     ctx->state_runtime.drink.finish_wait_tick = 0U;
+}
+
+static bool drink_cancel_confirmed(app_ctx_t *ctx, const char *label)
+{
+    if (!ctx) {
+        return false;
+    }
+
+    if (ctx->ms.drink_making_flg != DRINK_MAKER_NONE ||
+        ctx->ms.hot_water_flg != 0U ||
+        ctx->ms.grind_run_flg != 0U ||
+        ctx->ms.steam_flag == STEAM_RUNNING ||
+        (!ctx->state_runtime.drink.cancel_pending_ignore_flow &&
+         ctx->ms.flow_rate > DRINK_FINISH_IDLE_FLOW_MAX_ML_S)) {
+        if (ctx->state_runtime.drink.finish_wait_none_started) {
+            ESP_LOGI(TAG,
+                     "%s cancel confirm cleared tick=%lu making=%u hot_water=%u grind=%u steam=%s flow=%.2f",
+                     label ? label : "DRINK",
+                     (unsigned long)ctx->timer.tick,
+                     (unsigned)ctx->ms.drink_making_flg,
+                     (unsigned)ctx->ms.hot_water_flg,
+                     (unsigned)ctx->ms.grind_run_flg,
+                     steam_flag_name((uint8_t)ctx->ms.steam_flag),
+                     ctx->ms.flow_rate);
+        }
+        drink_clear_finish_wait(ctx);
+        return false;
+    }
+
+    if (!ctx->state_runtime.drink.finish_wait_none_started) {
+        ctx->state_runtime.drink.finish_wait_none_started = true;
+        ctx->state_runtime.drink.finish_wait_tick = ctx->timer.tick;
+        ESP_LOGI(TAG,
+                 "%s cancel confirm start tick=%lu making=%u hot_water=%u grind=%u steam=%s flow=%.2f",
+                 label ? label : "DRINK",
+                 (unsigned long)ctx->timer.tick,
+                 (unsigned)ctx->ms.drink_making_flg,
+                 (unsigned)ctx->ms.hot_water_flg,
+                 (unsigned)ctx->ms.grind_run_flg,
+                 steam_flag_name((uint8_t)ctx->ms.steam_flag),
+                 ctx->ms.flow_rate);
+        return false;
+    }
+
+    return (ctx->timer.tick - ctx->state_runtime.drink.finish_wait_tick) >=
+           DRINK_FINISH_CONFIRM_TICKS;
+}
+
+static bool drink_handle_cancel_pending(app_ctx_t *ctx, const char *label)
+{
+    control_action_t stop_action;
+
+    if (!ctx) {
+        return false;
+    }
+
+    if (drink_cancel_confirmed(ctx, label)) {
+        ESP_LOGI(TAG, "%s cancel confirmed -> READY", label ? label : "DRINK");
+        ctx->core.state = ST_READY;
+        return true;
+    }
+
+    if ((ctx->timer.tick - ctx->drink.target_time) >= DRINK_CANCEL_RETRY_TICKS) {
+        stop_action = drink_stop_action_for(ctx->drink.target_drink);
+        ctx->drink.target_time = ctx->timer.tick;
+        ctr_cmd_action(stop_action, NULL);
+        ESP_LOGI(TAG,
+                 "%s cancel pending retry tick=%lu action=%d making=%u hot_water=%u grind=%u steam=%s flow=%.2f",
+                 label ? label : "DRINK",
+                 (unsigned long)ctx->timer.tick,
+                 (int)stop_action,
+                 (unsigned)ctx->ms.drink_making_flg,
+                 (unsigned)ctx->ms.hot_water_flg,
+                 (unsigned)ctx->ms.grind_run_flg,
+                 steam_flag_name((uint8_t)ctx->ms.steam_flag),
+                 ctx->ms.flow_rate);
+    }
+
+    ctx->input.key_pressed = 0U;
+    ctx->input.key_long = 0U;
+    ctx->drink.elapsed_tick = drink_elapsed_seconds(ctx);
+    return false;
 }
 
 static bool drink_brew_finish_confirmed(app_ctx_t *ctx, const char *label)
@@ -618,8 +829,65 @@ static bool drink_brew_finish_confirmed(app_ctx_t *ctx, const char *label)
            DRINK_FINISH_CONFIRM_TICKS;
 }
 
+static bool drink_controller_self_abort_confirmed(app_ctx_t *ctx, const char *label)
+{
+    float raw_progress;
+
+    if (!ctx) {
+        return false;
+    }
+
+    if (ctx->core.substate != BREW_SUB_RUNNING_1) {
+        return false;
+    }
+
+    switch (ctx->core.state) {
+    case ST_ESPRESSO:
+    case ST_MASTER:
+    case ST_AMERICANO:
+    case ST_COLD_BREW:
+        break;
+
+    default:
+        return false;
+    }
+
+    if (ctx->ms.drink_making_flg != DRINK_MAKER_NONE) {
+        drink_clear_finish_wait(ctx);
+        return false;
+    }
+
+    raw_progress = sp_pro_get_raw_liquid_progress_ml(ctx);
+    if (ctx->state_runtime.drink.liquid_output_seen ||
+        raw_progress > DRINK_SELF_ABORT_NO_OUTPUT_MAX_ML) {
+        drink_clear_finish_wait(ctx);
+        return false;
+    }
+
+    if (!ctx->state_runtime.drink.finish_wait_none_started) {
+        ctx->state_runtime.drink.finish_wait_none_started = true;
+        ctx->state_runtime.drink.finish_wait_tick = ctx->timer.tick;
+        ESP_LOGW(TAG,
+                 "%s controller self-stop observed tick=%lu liquid=%.1f raw=%.1f flow_rate=%.2f",
+                 label ? label : "DRINK",
+                 (unsigned long)ctx->timer.tick,
+                 ctx->ms.liquid_weight,
+                 raw_progress,
+                 ctx->ms.flow_rate);
+        return false;
+    }
+
+    return (ctx->timer.tick - ctx->state_runtime.drink.finish_wait_tick) >=
+           DRINK_FINISH_CONFIRM_TICKS;
+}
+
 static inline void drink_return_ready(app_ctx_t *ctx)
 {
+    if (ctx && ctx->state_runtime.drink.parallel_steam_active) {
+        drink_promote_parallel_steam(ctx);
+        return;
+    }
+
     ctx->core.substate = 0;
     ctx->core.state = ST_READY;
 }
@@ -647,7 +915,7 @@ static bool drink_grind_sensor_cancelled(const app_ctx_t *ctx)
         return true;
     }
 
-    return (ctx->ms.beanbox_in_place == 0U);
+    return (ctx->ms.beanbox_in_place != 1U);
 }
 
 static bool drink_has_fault_cancel_condition(const app_ctx_t *ctx)
@@ -655,6 +923,10 @@ static bool drink_has_fault_cancel_condition(const app_ctx_t *ctx)
     if (!ctx) {
         return false;
     }
+
+#if APP_TEST_DISABLE_LOCAL_ALARM
+    return false;
+#endif
 
     return ctx->ms.error_code != 0U;
 }
@@ -681,6 +953,30 @@ static uint8_t drink_cancel_key_for(drink_type_t drink)
     }
 }
 
+static bool drink_cancel_requested_now(const app_ctx_t *ctx)
+{
+    uint16_t pressed_or_long;
+    uint8_t cancel_key;
+
+    if (!ctx) {
+        return false;
+    }
+
+    pressed_or_long = (uint16_t)(ctx->input.key_pressed | ctx->input.key_long);
+    if (pressed_or_long == 0U) {
+        return false;
+    }
+
+    if (drink_is_remote_flow(ctx)) {
+        return (pressed_or_long & (1U << KEY_ESPRESSO)) != 0U;
+    }
+
+    cancel_key = drink_cancel_key_for(ctx->drink.target_drink);
+    return ctx->drink.target_drink != DRINK_STEAM &&
+           cancel_key < KEY_MAX &&
+           ((pressed_or_long & (1U << cancel_key)) != 0U);
+}
+
 static control_action_t drink_stop_action_for(drink_type_t drink)
 {
     switch (drink) {
@@ -698,18 +994,95 @@ static control_action_t drink_stop_action_for(drink_type_t drink)
     }
 }
 
-static bool drink_supports_steam_redirect(drink_type_t drink)
+static bool drink_supports_parallel_steam(const app_ctx_t *ctx)
 {
-    switch (drink) {
-    case DRINK_ESPRESSO:
-    case DRINK_MASTER:
-    case DRINK_AMERICANO:
-    case DRINK_COLD_BREW:
-    case DRINK_WATER:
+    if (!ctx || drink_is_remote_flow(ctx)) {
+        return false;
+    }
+
+    if (ctx->core.substate != BREW_SUB_PREPARE &&
+        ctx->core.substate != BREW_SUB_REMOTE_COUNTDOWN &&
+        ctx->core.substate != BREW_SUB_RUNNING_1) {
+        return false;
+    }
+
+    switch (ctx->core.state) {
+    case ST_ESPRESSO:
+    case ST_MASTER:
+    case ST_COLD_BREW:
         return true;
+
+    case ST_AMERICANO:
+        return true;
+
     default:
         return false;
     }
+}
+
+static void drink_clear_parallel_steam(app_ctx_t *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+
+    ctx->state_runtime.drink.parallel_steam_active = false;
+    ctx->state_runtime.drink.parallel_steam_start_tick = 0U;
+}
+
+static bool drink_start_parallel_steam(app_ctx_t *ctx)
+{
+    if (!ctx ||
+        ctx->state_runtime.drink.parallel_steam_active ||
+        !drink_supports_parallel_steam(ctx)) {
+        return false;
+    }
+
+    ctx->ctrl.src = CTRL_SRC_UI;
+    if (!ctr_cmd_action(CTRL_ACT_STEAM_START, NULL)) {
+        ESP_LOGW(TAG,
+                 "Parallel steam start rejected state=%d sub=%d steam_flag=%s",
+                 ctx->core.state,
+                 ctx->core.substate,
+                 steam_flag_name((uint8_t)ctx->ms.steam_flag));
+        return false;
+    }
+
+    ctx->state_runtime.drink.parallel_steam_active = true;
+    ctx->state_runtime.drink.parallel_steam_start_tick = ctx->timer.tick;
+    ctx->state_runtime.drink.last_steam_flag = (uint8_t)ctx->ms.steam_flag;
+    ctx->state_runtime.drink.last_steam_log_sec = 0xFFFFFFFFU;
+    ESP_LOGI(TAG,
+             "Parallel steam start state=%d sub=%d steam_flag=%s",
+             ctx->core.state,
+             ctx->core.substate,
+             steam_flag_name((uint8_t)ctx->ms.steam_flag));
+    return true;
+}
+
+static void drink_promote_parallel_steam(app_ctx_t *ctx)
+{
+    if (!ctx || !ctx->state_runtime.drink.parallel_steam_active) {
+        return;
+    }
+
+    ctx->core.state = ST_STEAM;
+    ctx->core.substate = (ctx->ms.steam_flag == STEAM_RUNNING) ?
+                         BREW_SUB_RUNNING_1 :
+                         BREW_SUB_PREPARE;
+    ctx->drink.target_drink = DRINK_STEAM;
+    ctx->drink.steam_level = ctx->setting.steam_level;
+    ctx->drink.start_tick = (ctx->state_runtime.drink.parallel_steam_start_tick > 0U) ?
+                            ctx->state_runtime.drink.parallel_steam_start_tick :
+                            ctx->timer.tick;
+    ctx->state_runtime.drink.steam_started = true;
+    ctx->state_runtime.drink.last_steam_flag = (uint8_t)ctx->ms.steam_flag;
+    ctx->state_runtime.drink.last_steam_log_sec = 0xFFFFFFFFU;
+    drink_clear_parallel_steam(ctx);
+    ESP_LOGI(TAG,
+             "Promote parallel steam to standalone sub=%d steam_flag=%s",
+             ctx->core.substate,
+             steam_flag_name((uint8_t)ctx->ms.steam_flag));
 }
 
 static void drink_abort_active_process(app_ctx_t *ctx, drink_exit_reason_t reason)
@@ -822,6 +1195,7 @@ static app_state_t drink_leave_state(app_ctx_t *ctx,
                 if (remote_action_started) {
                     device_statistics_notify_remote_cancel();
                     drink_record_notify_remote_cancel();
+                    extraction_curve_notify_remote_cancel();
                 }
                 break;
 
@@ -829,6 +1203,7 @@ static app_state_t drink_leave_state(app_ctx_t *ctx,
                 if (remote_action_started) {
                     device_statistics_notify_remote_cancel();
                     drink_record_notify_remote_fail();
+                    extraction_curve_notify_remote_fail();
                 }
                 break;
 
@@ -842,11 +1217,13 @@ static app_state_t drink_leave_state(app_ctx_t *ctx,
             case DRINK_EXIT_SWITCH_TO_STEAM:
                 device_statistics_notify_local_state_cancel(active_state);
                 drink_record_notify_local_state_cancel(active_state);
+                extraction_curve_notify_local_state_cancel(active_state);
                 break;
 
             case DRINK_EXIT_FAIL:
                 device_statistics_notify_local_state_cancel(active_state);
                 drink_record_notify_local_state_fail(active_state);
+                extraction_curve_notify_local_state_fail(active_state);
                 break;
 
             case DRINK_EXIT_NONE:
@@ -866,6 +1243,7 @@ static app_state_t drink_leave_state(app_ctx_t *ctx,
 app_state_t state_handle_espresso(app_ctx_t *ctx)
 {
     bool *started = &ctx->state_runtime.drink.espresso_started;
+    uint32_t elapsed_sec = drink_elapsed_seconds(ctx);
 
     if (!*started) {
         if (drink_is_remote_flow(ctx)) {
@@ -876,6 +1254,7 @@ app_state_t state_handle_espresso(app_ctx_t *ctx)
             drink_prepare_local_entry(ctx, true);
             device_statistics_notify_local_state_start(ST_ESPRESSO);
             drink_record_notify_local_state_start(ST_ESPRESSO, &settings);
+            extraction_curve_notify_local_state_start(ST_ESPRESSO, &settings);
         }
         *started = true;
     }
@@ -891,28 +1270,94 @@ app_state_t state_handle_espresso(app_ctx_t *ctx)
         break;
 
     case BREW_SUB_PREPARE:
+        if (!drink_is_remote_flow(ctx) && drink_cancel_requested_now(ctx)) {
+            drink_enter_cancel_pending(ctx);
+            voice_manager_play_interrupt(VOICE_CANCELMAKECOFFEE);
+            break;
+        }
+
         if (!drink_is_remote_flow(ctx) &&
             !ctx->state_runtime.drink.prepare_cmd_sent &&
             sp_pro_app_is_brew_handle_in_place()) {
             drink_prepare_send_local_action(ctx, CTRL_ACT_ESPRESSO);
         }
 
+        if (ctx->state_runtime.drink.last_water_log_sec != elapsed_sec) {
+            ctx->state_runtime.drink.last_water_log_sec = elapsed_sec;
+            ESP_LOGI(TAG,
+                     "ESP prepare tick=%lu elapsed=%lus making_flg=%u flow_rate=%.2f temp=%.1f liquid=%.1f target=%u",
+                     (unsigned long)ctx->timer.tick,
+                     (unsigned long)elapsed_sec,
+                     (unsigned)ctx->ms.drink_making_flg,
+                     ctx->ms.flow_rate,
+                     ctx->ms.hot_current_temp,
+                     ctx->ms.liquid_weight,
+                     (unsigned)ctx->drink.target_ml);
+        }
+
         if (check_drink_flag_ready(ctx)) {
+            ESP_LOGI(TAG,
+                     "ESP prepare -> running tick=%lu making_flg=%u flow_rate=%.2f temp=%.1f liquid=%.1f target=%u",
+                     (unsigned long)ctx->timer.tick,
+                     (unsigned)ctx->ms.drink_making_flg,
+                     ctx->ms.flow_rate,
+                     ctx->ms.hot_current_temp,
+                     ctx->ms.liquid_weight,
+                     (unsigned)ctx->drink.target_ml);
             drink_enter_running(ctx, BREW_SUB_RUNNING_1);
+            ctx->state_runtime.drink.last_water_log_sec = 0xFFFFFFFFU;
+        }
+        break;
+
+    case BREW_SUB_CANCEL_PENDING:
+        if (drink_handle_cancel_pending(ctx, "ESP")) {
+            return drink_leave_state(ctx, ST_ESPRESSO, started);
         }
         break;
 
     case BREW_SUB_RUNNING_1:
+        elapsed_sec = drink_elapsed_seconds(ctx);
+        drink_rebase_if_counter_reset(ctx, "ESP");
+        if (!ctx->state_runtime.drink.liquid_output_seen &&
+            (sp_pro_get_raw_liquid_progress_ml(ctx) > 0.1f ||
+             ctx->ms.flow_rate > WATER_DISPLAY_FLOW_MIN_ML_S)) {
+            ctx->state_runtime.drink.liquid_output_seen = true;
+            ESP_LOGI(TAG,
+                     "ESP first liquid output tick=%lu elapsed=%lus liquid=%.1f raw=%.1f display=%.1f flow_rate=%.2f target=%u",
+                     (unsigned long)ctx->timer.tick,
+                     (unsigned long)elapsed_sec,
+                     ctx->ms.liquid_weight,
+                     sp_pro_get_raw_liquid_progress_ml(ctx),
+                     sp_pro_get_display_liquid_ml(ctx),
+                     ctx->ms.flow_rate,
+                     (unsigned)ctx->drink.target_ml);
+        }
+        if (ctx->state_runtime.drink.last_water_log_sec != elapsed_sec) {
+            ctx->state_runtime.drink.last_water_log_sec = elapsed_sec;
+            ESP_LOGI(TAG,
+                     "ESP running tick=%lu elapsed=%lus liquid=%.1f raw=%.1f display=%.1f flow_rate=%.2f target=%u making_flg=%u",
+                     (unsigned long)ctx->timer.tick,
+                     (unsigned long)elapsed_sec,
+                     ctx->ms.liquid_weight,
+                     sp_pro_get_raw_liquid_progress_ml(ctx),
+                     sp_pro_get_display_liquid_ml(ctx),
+                     ctx->ms.flow_rate,
+                     (unsigned)ctx->drink.target_ml,
+                     (unsigned)ctx->ms.drink_making_flg);
+        }
         if (drink_local_target_reached(ctx, "ESP")) {
             ESP_LOGE(TAG, "ESP LOCAL TARGET FINISH");
             if (!drink_is_remote_flow(ctx)) {
                 drink_record_notify_local_state_success(ST_ESPRESSO);
+                extraction_curve_notify_local_state_success(ST_ESPRESSO);
             }
             drink_enter_finish(ctx, CTRL_ACT_CANCEL);
-        } else if (drink_brew_finish_confirmed(ctx, "ESP")) {
+        } else if (ctx->state_runtime.drink.liquid_output_seen &&
+                   drink_brew_finish_confirmed(ctx, "ESP")) {
             ESP_LOGE(TAG, "ESP FINISH");
             if (!drink_is_remote_flow(ctx)) {
                 drink_record_notify_local_state_success(ST_ESPRESSO);
+                extraction_curve_notify_local_state_success(ST_ESPRESSO);
             }
             drink_enter_finish(ctx, CTRL_ACT_CANCEL);
         }
@@ -926,7 +1371,9 @@ app_state_t state_handle_espresso(app_ctx_t *ctx)
         break;
     }
 
-    handle_making_base(ctx);
+    if (ctx->core.substate != BREW_SUB_CANCEL_PENDING) {
+        handle_making_base(ctx);
+    }
     return drink_leave_state(ctx, ST_ESPRESSO, started);
 }
 
@@ -943,6 +1390,7 @@ app_state_t state_handle_master(app_ctx_t *ctx)
             drink_prepare_local_entry(ctx, true);
             device_statistics_notify_local_state_start(ST_MASTER);
             drink_record_notify_local_state_start(ST_MASTER, &settings);
+            extraction_curve_notify_local_state_start(ST_MASTER, &settings);
         }
         *started = true;
     }
@@ -958,6 +1406,12 @@ app_state_t state_handle_master(app_ctx_t *ctx)
         break;
 
     case BREW_SUB_PREPARE:
+        if (!drink_is_remote_flow(ctx) && drink_cancel_requested_now(ctx)) {
+            drink_enter_cancel_pending(ctx);
+            voice_manager_play_interrupt(VOICE_CANCELMAKECOFFEE);
+            break;
+        }
+
         if (!drink_is_remote_flow(ctx) &&
             !ctx->state_runtime.drink.prepare_cmd_sent &&
             sp_pro_app_is_brew_handle_in_place()) {
@@ -969,17 +1423,27 @@ app_state_t state_handle_master(app_ctx_t *ctx)
         }
         break;
 
+    case BREW_SUB_CANCEL_PENDING:
+        if (drink_handle_cancel_pending(ctx, "MASTER")) {
+            return drink_leave_state(ctx, ST_MASTER, started);
+        }
+        break;
+
     case BREW_SUB_RUNNING_1:
+        drink_rebase_if_counter_reset(ctx, "MASTER");
         if (drink_local_target_reached(ctx, "MASTER")) {
             ESP_LOGE(TAG, "MASTER LOCAL TARGET FINISH");
             if (!drink_is_remote_flow(ctx)) {
                 drink_record_notify_local_state_success(ST_MASTER);
+                extraction_curve_notify_local_state_success(ST_MASTER);
             }
             drink_enter_finish(ctx, CTRL_ACT_CANCEL);
-        } else if (drink_brew_finish_confirmed(ctx, "MASTER")) {
+        } else if (ctx->state_runtime.drink.liquid_output_seen &&
+                   drink_brew_finish_confirmed(ctx, "MASTER")) {
             ESP_LOGE(TAG, "MASTER FINISH");
             if (!drink_is_remote_flow(ctx)) {
                 drink_record_notify_local_state_success(ST_MASTER);
+                extraction_curve_notify_local_state_success(ST_MASTER);
             }
             drink_enter_finish(ctx, CTRL_ACT_CANCEL);
         }
@@ -993,7 +1457,9 @@ app_state_t state_handle_master(app_ctx_t *ctx)
         break;
     }
 
-    handle_making_base(ctx);
+    if (ctx->core.substate != BREW_SUB_CANCEL_PENDING) {
+        handle_making_base(ctx);
+    }
     return drink_leave_state(ctx, ST_MASTER, started);
 }
 
@@ -1001,6 +1467,7 @@ app_state_t state_handle_americano(app_ctx_t *ctx)
 {
     bool *started = &ctx->state_runtime.drink.americano_started;
     bool *wait_none_started = &ctx->state_runtime.drink.americano_wait_none_started;
+    uint32_t elapsed_sec = drink_elapsed_seconds(ctx);
 
     if (!*started) {
         if (drink_is_remote_flow(ctx)) {
@@ -1011,6 +1478,7 @@ app_state_t state_handle_americano(app_ctx_t *ctx)
             drink_prepare_local_entry(ctx, true);
             device_statistics_notify_local_state_start(ST_AMERICANO);
             drink_record_notify_local_state_start(ST_AMERICANO, &settings);
+            extraction_curve_notify_local_state_start(ST_AMERICANO, &settings);
         }
         *started = true;
         *wait_none_started = false;
@@ -1027,28 +1495,116 @@ app_state_t state_handle_americano(app_ctx_t *ctx)
         break;
 
     case BREW_SUB_PREPARE:
+        if (!drink_is_remote_flow(ctx) && drink_cancel_requested_now(ctx)) {
+            drink_enter_cancel_pending(ctx);
+            voice_manager_play_interrupt(VOICE_CANCELMAKECOFFEE);
+            break;
+        }
+
         if (drink_is_remote_flow(ctx)) {
             if (!sp_pro_app_is_brew_handle_in_place()) {
                 break;
             }
 
+            if (ctx->state_runtime.drink.last_water_log_sec != elapsed_sec) {
+                ctx->state_runtime.drink.last_water_log_sec = elapsed_sec;
+                ESP_LOGI(TAG,
+                         "AME_BREW prepare tick=%lu elapsed=%lus making_flg=%u flow_rate=%.2f temp=%.1f liquid=%.1f target=%u",
+                         (unsigned long)ctx->timer.tick,
+                         (unsigned long)elapsed_sec,
+                         (unsigned)ctx->ms.drink_making_flg,
+                         ctx->ms.flow_rate,
+                         ctx->ms.hot_current_temp,
+                         ctx->ms.liquid_weight,
+                         (unsigned)ctx->drink.target_ml);
+            }
+
             if (check_drink_flag_ready(ctx)) {
                 drink_apply_remote_targets(ctx, false);
+                ESP_LOGI(TAG,
+                         "AME_BREW prepare -> running tick=%lu making_flg=%u flow_rate=%.2f temp=%.1f liquid=%.1f target=%u",
+                         (unsigned long)ctx->timer.tick,
+                         (unsigned)ctx->ms.drink_making_flg,
+                         ctx->ms.flow_rate,
+                         ctx->ms.hot_current_temp,
+                         ctx->ms.liquid_weight,
+                         (unsigned)ctx->drink.target_ml);
                 drink_enter_running(ctx, BREW_SUB_RUNNING_1);
+                ctx->state_runtime.drink.last_water_log_sec = 0xFFFFFFFFU;
             }
         } else {
             if (!ctx->state_runtime.drink.prepare_cmd_sent &&
                 sp_pro_app_is_brew_handle_in_place()) {
+                if (drink_cancel_requested_now(ctx)) {
+                    break;
+                }
                 drink_prepare_send_local_action(ctx, CTRL_ACT_AMERICANO_BREW);
             }
 
+            if (ctx->state_runtime.drink.last_water_log_sec != elapsed_sec) {
+                ctx->state_runtime.drink.last_water_log_sec = elapsed_sec;
+                ESP_LOGI(TAG,
+                         "AME_BREW prepare tick=%lu elapsed=%lus making_flg=%u flow_rate=%.2f temp=%.1f liquid=%.1f target=%u",
+                         (unsigned long)ctx->timer.tick,
+                         (unsigned long)elapsed_sec,
+                         (unsigned)ctx->ms.drink_making_flg,
+                         ctx->ms.flow_rate,
+                         ctx->ms.hot_current_temp,
+                         ctx->ms.liquid_weight,
+                         (unsigned)ctx->drink.target_ml);
+            }
+
             if (check_drink_flag_ready(ctx)) {
+                ESP_LOGI(TAG,
+                         "AME_BREW prepare -> running tick=%lu making_flg=%u flow_rate=%.2f temp=%.1f liquid=%.1f target=%u",
+                         (unsigned long)ctx->timer.tick,
+                         (unsigned)ctx->ms.drink_making_flg,
+                         ctx->ms.flow_rate,
+                         ctx->ms.hot_current_temp,
+                         ctx->ms.liquid_weight,
+                         (unsigned)ctx->drink.target_ml);
                 drink_enter_running(ctx, BREW_SUB_RUNNING_1);
+                ctx->state_runtime.drink.last_water_log_sec = 0xFFFFFFFFU;
             }
         }
         break;
 
+    case BREW_SUB_CANCEL_PENDING:
+        if (drink_handle_cancel_pending(ctx, "AME")) {
+            return drink_leave_state(ctx, ST_AMERICANO, started);
+        }
+        break;
+
     case BREW_SUB_RUNNING_1:
+        elapsed_sec = drink_elapsed_seconds(ctx);
+        drink_rebase_if_counter_reset(ctx, "AME_BREW");
+        if (!ctx->state_runtime.drink.liquid_output_seen &&
+            (sp_pro_get_raw_liquid_progress_ml(ctx) > 0.1f ||
+             ctx->ms.flow_rate > WATER_DISPLAY_FLOW_MIN_ML_S)) {
+            ctx->state_runtime.drink.liquid_output_seen = true;
+            ESP_LOGI(TAG,
+                     "AME_BREW first liquid output tick=%lu elapsed=%lus liquid=%.1f raw=%.1f display=%.1f flow_rate=%.2f target=%u",
+                     (unsigned long)ctx->timer.tick,
+                     (unsigned long)elapsed_sec,
+                     ctx->ms.liquid_weight,
+                     sp_pro_get_raw_liquid_progress_ml(ctx),
+                     sp_pro_get_display_liquid_ml(ctx),
+                     ctx->ms.flow_rate,
+                     (unsigned)ctx->drink.target_ml);
+        }
+        if (ctx->state_runtime.drink.last_water_log_sec != elapsed_sec) {
+            ctx->state_runtime.drink.last_water_log_sec = elapsed_sec;
+            ESP_LOGI(TAG,
+                     "AME_BREW running tick=%lu elapsed=%lus liquid=%.1f raw=%.1f display=%.1f flow_rate=%.2f target=%u making_flg=%u",
+                     (unsigned long)ctx->timer.tick,
+                     (unsigned long)elapsed_sec,
+                     ctx->ms.liquid_weight,
+                     sp_pro_get_raw_liquid_progress_ml(ctx),
+                     sp_pro_get_display_liquid_ml(ctx),
+                     ctx->ms.flow_rate,
+                     (unsigned)ctx->drink.target_ml,
+                     (unsigned)ctx->ms.drink_making_flg);
+        }
         if (drink_is_remote_flow(ctx)) {
             if (ctx->ms.drink_making_flg != DRINK_MAKER_NONE) {
                 *wait_none_started = false;
@@ -1056,7 +1612,8 @@ app_state_t state_handle_americano(app_ctx_t *ctx)
                 break;
             }
 
-            if (!drink_brew_finish_confirmed(ctx, "AME_BREW_REMOTE")) {
+            if (!(ctx->state_runtime.drink.liquid_output_seen &&
+                  drink_brew_finish_confirmed(ctx, "AME_BREW_REMOTE"))) {
                 break;
             }
 
@@ -1098,7 +1655,8 @@ app_state_t state_handle_americano(app_ctx_t *ctx)
             }
 
             if (!brew_target_hit &&
-                !drink_brew_finish_confirmed(ctx, "AME_BREW")) {
+                !(ctx->state_runtime.drink.liquid_output_seen &&
+                  drink_brew_finish_confirmed(ctx, "AME_BREW"))) {
                 break;
             }
 
@@ -1110,6 +1668,9 @@ app_state_t state_handle_americano(app_ctx_t *ctx)
             }
 
             if (ctx->timer.tick - ctx->drink.target_time >= STAY_TICKS_2S) {
+                if (drink_cancel_requested_now(ctx)) {
+                    break;
+                }
                 ctx->ctrl.src = CTRL_SRC_UI;
                 ctr_cmd_action(CTRL_ACT_AMERICANO_WATER, NULL);
                 ctx->drink.target_ml = (uint16_t)(ctx->setting.ame_water_w + 0.5f);
@@ -1126,6 +1687,7 @@ app_state_t state_handle_americano(app_ctx_t *ctx)
         break;
 
     case BREW_SUB_RUNNING_2:
+        drink_water_rebase_if_counter_reset(ctx, "AME_WATER");
         drink_water_display_update(ctx);
         if (!ctx->state_runtime.drink.americano_water_started &&
             (ctx->ms.hot_water_flg != 0U ||
@@ -1145,6 +1707,7 @@ app_state_t state_handle_americano(app_ctx_t *ctx)
             ESP_LOGE(TAG, "AME LOCAL TARGET FINISH");
             if (!drink_is_remote_flow(ctx)) {
                 drink_record_notify_local_state_success(ST_AMERICANO);
+                extraction_curve_notify_local_state_success(ST_AMERICANO);
             }
             drink_enter_finish(ctx, CTRL_ACT_CANCEL);
         } else if (ctx->state_runtime.drink.americano_water_started &&
@@ -1152,6 +1715,7 @@ app_state_t state_handle_americano(app_ctx_t *ctx)
             ESP_LOGE(TAG, "AME FINISH");
             if (!drink_is_remote_flow(ctx)) {
                 drink_record_notify_local_state_success(ST_AMERICANO);
+                extraction_curve_notify_local_state_success(ST_AMERICANO);
             }
             drink_enter_finish(ctx, CTRL_ACT_CANCEL);
         }
@@ -1165,7 +1729,9 @@ app_state_t state_handle_americano(app_ctx_t *ctx)
         break;
     }
 
-    handle_making_base(ctx);
+    if (ctx->core.substate != BREW_SUB_CANCEL_PENDING) {
+        handle_making_base(ctx);
+    }
 
     if (ctx->core.state != ST_AMERICANO) {
         *wait_none_started = false;
@@ -1177,6 +1743,7 @@ app_state_t state_handle_americano(app_ctx_t *ctx)
 app_state_t state_handle_cold_brew(app_ctx_t *ctx)
 {
     bool *started = &ctx->state_runtime.drink.cold_brew_started;
+    uint32_t elapsed_sec = drink_elapsed_seconds(ctx);
 
     if (!*started) {
         if (drink_is_remote_flow(ctx)) {
@@ -1187,6 +1754,7 @@ app_state_t state_handle_cold_brew(app_ctx_t *ctx)
             drink_prepare_local_entry(ctx, true);
             device_statistics_notify_local_state_start(ST_COLD_BREW);
             drink_record_notify_local_state_start(ST_COLD_BREW, &settings);
+            extraction_curve_notify_local_state_start(ST_COLD_BREW, &settings);
         }
         *started = true;
     }
@@ -1202,28 +1770,94 @@ app_state_t state_handle_cold_brew(app_ctx_t *ctx)
         break;
 
     case BREW_SUB_PREPARE:
+        if (!drink_is_remote_flow(ctx) && drink_cancel_requested_now(ctx)) {
+            drink_enter_cancel_pending(ctx);
+            voice_manager_play_interrupt(VOICE_CANCELMAKECOFFEE);
+            break;
+        }
+
         if (!drink_is_remote_flow(ctx) &&
             !ctx->state_runtime.drink.prepare_cmd_sent &&
             sp_pro_app_is_brew_handle_in_place()) {
             drink_prepare_send_local_action(ctx, CTRL_ACT_COLD_BREW);
         }
 
+        if (ctx->state_runtime.drink.last_water_log_sec != elapsed_sec) {
+            ctx->state_runtime.drink.last_water_log_sec = elapsed_sec;
+            ESP_LOGI(TAG,
+                     "COLD prepare tick=%lu elapsed=%lus making_flg=%u flow_rate=%.2f temp=%.1f liquid=%.1f target=%u",
+                     (unsigned long)ctx->timer.tick,
+                     (unsigned long)elapsed_sec,
+                     (unsigned)ctx->ms.drink_making_flg,
+                     ctx->ms.flow_rate,
+                     ctx->ms.hot_current_temp,
+                     ctx->ms.liquid_weight,
+                     (unsigned)ctx->drink.target_ml);
+        }
+
         if (check_drink_flag_ready(ctx)) {
+            ESP_LOGI(TAG,
+                     "COLD prepare -> running tick=%lu making_flg=%u flow_rate=%.2f temp=%.1f liquid=%.1f target=%u",
+                     (unsigned long)ctx->timer.tick,
+                     (unsigned)ctx->ms.drink_making_flg,
+                     ctx->ms.flow_rate,
+                     ctx->ms.hot_current_temp,
+                     ctx->ms.liquid_weight,
+                     (unsigned)ctx->drink.target_ml);
             drink_enter_running(ctx, BREW_SUB_RUNNING_1);
+            ctx->state_runtime.drink.last_water_log_sec = 0xFFFFFFFFU;
+        }
+        break;
+
+    case BREW_SUB_CANCEL_PENDING:
+        if (drink_handle_cancel_pending(ctx, "COLD")) {
+            return drink_leave_state(ctx, ST_COLD_BREW, started);
         }
         break;
 
     case BREW_SUB_RUNNING_1:
+        drink_rebase_if_counter_reset(ctx, "COLD");
+        elapsed_sec = drink_elapsed_seconds(ctx);
+        if (!ctx->state_runtime.drink.liquid_output_seen &&
+            (sp_pro_get_raw_liquid_progress_ml(ctx) > 0.1f ||
+             ctx->ms.flow_rate > WATER_DISPLAY_FLOW_MIN_ML_S)) {
+            ctx->state_runtime.drink.liquid_output_seen = true;
+            ESP_LOGI(TAG,
+                     "COLD first liquid output tick=%lu elapsed=%lus liquid=%.1f raw=%.1f display=%.1f flow_rate=%.2f target=%u",
+                     (unsigned long)ctx->timer.tick,
+                     (unsigned long)elapsed_sec,
+                     ctx->ms.liquid_weight,
+                     sp_pro_get_raw_liquid_progress_ml(ctx),
+                     sp_pro_get_display_liquid_ml(ctx),
+                     ctx->ms.flow_rate,
+                     (unsigned)ctx->drink.target_ml);
+        }
+        if (ctx->state_runtime.drink.last_water_log_sec != elapsed_sec) {
+            ctx->state_runtime.drink.last_water_log_sec = elapsed_sec;
+            ESP_LOGI(TAG,
+                     "COLD running tick=%lu elapsed=%lus liquid=%.1f raw=%.1f display=%.1f flow_rate=%.2f target=%u making_flg=%u",
+                     (unsigned long)ctx->timer.tick,
+                     (unsigned long)elapsed_sec,
+                     ctx->ms.liquid_weight,
+                     sp_pro_get_raw_liquid_progress_ml(ctx),
+                     sp_pro_get_display_liquid_ml(ctx),
+                     ctx->ms.flow_rate,
+                     (unsigned)ctx->drink.target_ml,
+                     (unsigned)ctx->ms.drink_making_flg);
+        }
         if (drink_local_target_reached(ctx, "COLD")) {
             ESP_LOGE(TAG, "COLD LOCAL TARGET FINISH");
             if (!drink_is_remote_flow(ctx)) {
                 drink_record_notify_local_state_success(ST_COLD_BREW);
+                extraction_curve_notify_local_state_success(ST_COLD_BREW);
             }
             drink_enter_finish(ctx, CTRL_ACT_CANCEL);
-        } else if (drink_brew_finish_confirmed(ctx, "COLD")) {
+        } else if (ctx->state_runtime.drink.liquid_output_seen &&
+                   drink_brew_finish_confirmed(ctx, "COLD")) {
             ESP_LOGE(TAG, "COLD FINISH");
             if (!drink_is_remote_flow(ctx)) {
                 drink_record_notify_local_state_success(ST_COLD_BREW);
+                extraction_curve_notify_local_state_success(ST_COLD_BREW);
             }
             drink_enter_finish(ctx, CTRL_ACT_CANCEL);
         }
@@ -1237,7 +1871,9 @@ app_state_t state_handle_cold_brew(app_ctx_t *ctx)
         break;
     }
 
-    handle_making_base(ctx);
+    if (ctx->core.substate != BREW_SUB_CANCEL_PENDING) {
+        handle_making_base(ctx);
+    }
     return drink_leave_state(ctx, ST_COLD_BREW, started);
 }
 
@@ -1282,6 +1918,12 @@ app_state_t state_handle_water(app_ctx_t *ctx)
         break;
 
     case BREW_SUB_PREPARE:
+        if (!drink_is_remote_flow(ctx) && drink_cancel_requested_now(ctx)) {
+            drink_enter_cancel_pending(ctx);
+            voice_manager_play_interrupt(VOICE_CANCELMAKECOFFEE);
+            break;
+        }
+
         if (ctx->state_runtime.drink.last_water_log_sec != elapsed_sec) {
             ctx->state_runtime.drink.last_water_log_sec = elapsed_sec;
             ESP_LOGI(TAG,
@@ -1300,17 +1942,23 @@ app_state_t state_handle_water(app_ctx_t *ctx)
                      (unsigned long)ctx->timer.tick,
                      (unsigned)ctx->ms.hot_water_flg,
                      ctx->ms.flow_rate,
-                     ctx->ms.hot_current_temp,
-                     ctx->ms.liquid_weight,
-                     (unsigned)ctx->drink.target_ml);
+                      ctx->ms.hot_current_temp,
+                      ctx->ms.liquid_weight,
+                      (unsigned)ctx->drink.target_ml);
             drink_enter_running(ctx, BREW_SUB_RUNNING_1);
-            drink_water_display_reset(ctx);
             ctx->state_runtime.drink.last_water_log_sec = 0xFFFFFFFFU;
+        }
+        break;
+
+    case BREW_SUB_CANCEL_PENDING:
+        if (drink_handle_cancel_pending(ctx, "WATER")) {
+            return drink_leave_state(ctx, ST_WATER, started);
         }
         break;
 
     case BREW_SUB_RUNNING_1:
         elapsed_sec = drink_elapsed_seconds(ctx);
+        drink_water_rebase_if_counter_reset(ctx, "WATER");
         drink_water_display_update(ctx);
         if (!ctx->state_runtime.drink.liquid_output_seen &&
             (ctx->state_runtime.drink.display_liquid_ml > 0.1f ||
@@ -1395,7 +2043,9 @@ app_state_t state_handle_water(app_ctx_t *ctx)
         break;
     }
 
-    handle_making_base(ctx);
+    if (ctx->core.substate != BREW_SUB_CANCEL_PENDING) {
+        handle_making_base(ctx);
+    }
     return drink_leave_state(ctx, ST_WATER, started);
 }
 
@@ -1441,6 +2091,29 @@ app_state_t state_handle_steam(app_ctx_t *ctx)
     elapsed_sec = (ctx->timer.tick - ctx->drink.start_tick) / STAY_TICKS_1S;
 
     switch (ctx->core.substate) {
+    case BREW_SUB_PREPARE:
+        if (ctx->state_runtime.drink.last_steam_flag != (uint8_t)ctx->ms.steam_flag) {
+            ctx->state_runtime.drink.last_steam_flag = (uint8_t)ctx->ms.steam_flag;
+            ESP_LOGI(TAG,
+                     "STEAM prepare flag update tick=%lu steam_flag=%s",
+                     (unsigned long)ctx->timer.tick,
+                     steam_flag_name((uint8_t)ctx->ms.steam_flag));
+        }
+
+        if (steam_stop_requested(ctx)) {
+            ctr_cmd_action(CTRL_ACT_STEAM_STOP, NULL);
+            ctx->core.state = ST_READY;
+            break;
+        }
+
+        if (ctx->ms.steam_flag == STEAM_RUNNING) {
+            ctx->drink.start_tick = ctx->timer.tick;
+            ctx->core.substate = BREW_SUB_RUNNING_1;
+            ctx->state_runtime.drink.last_steam_log_sec = 0xFFFFFFFFU;
+            ESP_LOGI(TAG, "STEAM prepare -> running tick=%lu", (unsigned long)ctx->timer.tick);
+        }
+        break;
+
     case BREW_SUB_RUNNING_1:
         if (ctx->state_runtime.drink.last_steam_flag != (uint8_t)ctx->ms.steam_flag) {
             ESP_LOGI(TAG,
@@ -1634,6 +2307,15 @@ app_state_t state_handle_grind(app_ctx_t *ctx)
 
     switch (ctx->core.substate) {
     case BREW_SUB_PREPARE:
+        if (ctx->ms.beanbox_in_place != 1U) {
+            ESP_LOGI(TAG,
+                     "GRIND prepare blocked by hopper state tick=%lu hopper=%u -> READY",
+                     (unsigned long)ctx->timer.tick,
+                     (unsigned)ctx->ms.beanbox_in_place);
+            ctx->core.state = ST_READY;
+            break;
+        }
+
         if (ctx->ms.grind_handle_postion_flag != 1U) {
             if (ctx->input.key_pressed & (1U << KEY_GRIND)) {
                 ctx->input.key_pressed &= ~(1U << KEY_GRIND);
@@ -1803,7 +2485,29 @@ void handle_making_base(app_ctx_t *ctx)
                  "Making auto-cancelled by fault: state=%d error=0x%08lX",
                  ctx->core.state,
                  (unsigned long)ctx->ms.error_code);
+        if (ctx->state_runtime.drink.parallel_steam_active) {
+            ctr_cmd_action(CTRL_ACT_STEAM_STOP, NULL);
+            drink_clear_parallel_steam(ctx);
+        }
         drink_abort_active_process(ctx, DRINK_EXIT_FAIL);
+        ctx->core.state = ST_READY;
+        return;
+    }
+
+    if (drink_controller_self_abort_confirmed(ctx, "DRINK")) {
+        ESP_LOGW(TAG,
+                 "Making aborted by controller self-stop: state=%d target=%d liquid=%.1f raw=%.1f flow_rate=%.2f",
+                 ctx->core.state,
+                 ctx->drink.target_drink,
+                 ctx->ms.liquid_weight,
+                 sp_pro_get_raw_liquid_progress_ml(ctx),
+                 ctx->ms.flow_rate);
+        if (ctx->state_runtime.drink.parallel_steam_active) {
+            ctr_cmd_action(CTRL_ACT_STEAM_STOP, NULL);
+            drink_clear_parallel_steam(ctx);
+        }
+        drink_clear_finish_wait(ctx);
+        ctx->state_runtime.drink.exit_reason = DRINK_EXIT_FAIL;
         ctx->core.state = ST_READY;
         return;
     }
@@ -1863,14 +2567,16 @@ void handle_making_base(app_ctx_t *ctx)
                  (unsigned)ctx->ms.beanbox_in_place);
     }
 
-    if ((pressed & (1U << KEY_STEAM)) && drink_supports_steam_redirect(ctx->drink.target_drink)) {
-        ESP_LOGI(TAG, "Switch drink to steam by steam key");
+    if ((pressed & (1U << KEY_STEAM)) && drink_supports_parallel_steam(ctx)) {
         ctx->input.key_pressed &= ~(1U << KEY_STEAM);
-        drink_abort_active_process(ctx, DRINK_EXIT_SWITCH_TO_STEAM);
-        ctx->drink.target_drink = DRINK_STEAM;
-        ctx->drink.steam_level = ctx->setting.steam_level;
-        ctx->core.substate = 0;
-        ctx->core.state = ST_STEAM;
+
+        if (ctx->state_runtime.drink.parallel_steam_active) {
+            ctr_cmd_action(CTRL_ACT_STEAM_STOP, NULL);
+            drink_clear_parallel_steam(ctx);
+            ESP_LOGI(TAG, "Parallel steam stopped by steam key");
+        } else {
+            (void)drink_start_parallel_steam(ctx);
+        }
         return;
     }
 
@@ -1887,7 +2593,11 @@ void handle_making_base(app_ctx_t *ctx)
         if (ctx->drink.target_drink != DRINK_STEAM && ctx->drink.target_drink != DRINK_GRIND) {
             voice_manager_play_interrupt(VOICE_CANCELMAKECOFFEE);
         }
-        ctx->core.state = ST_READY;
+        if (ctx->state_runtime.drink.parallel_steam_active) {
+            drink_promote_parallel_steam(ctx);
+        } else {
+            ctx->core.state = ST_READY;
+        }
         return;
     }
 

@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -24,9 +25,9 @@
 #define DEVICE_STATS_STEAM_MIN_MS           (10000LL)
 #define DEVICE_STATS_VALID_UNIX_TIME        1700000000LL
 #define DEVICE_STATS_DAY_MS                 (24LL * 60LL * 60LL * 1000LL)
-#define DEVICE_STATS_BACKWASH_TOTAL_COUNT   100U
-#define DEVICE_STATS_STEAM_CLEAN_TOTAL      10U
-#define DEVICE_STATS_DESCALING_TOTAL_COUNT  200U
+#define DEVICE_STATS_BACKWASH_TOTAL_COUNT   150U
+#define DEVICE_STATS_STEAM_CLEAN_TOTAL      20U
+#define DEVICE_STATS_DESCALING_TOTAL_COUNT  150U
 #define DEVICE_STATS_INVALID_DAY_INDEX      0xFFFFU
 
 static const char *TAG = "DEVICE_STATS";
@@ -85,10 +86,10 @@ typedef struct {
     int64_t idle_since_ms;
 } device_statistics_session_t;
 
-static device_statistics_store_t s_device_stats = {0};
+static EXT_RAM_BSS_ATTR device_statistics_store_t s_device_stats = {0};
 static device_statistics_session_t s_session = {0};
 static beverage_period_data_t s_beverage_periods[DEVICE_STATS_BEVERAGE_PERIOD_COUNT] = {0};
-static beverage_data_t s_beverage_period_items[DEVICE_STATS_BEVERAGE_PERIOD_COUNT][DEVICE_STATS_DRINK_KIND_COUNT] = {0};
+static EXT_RAM_BSS_ATTR beverage_data_t s_beverage_period_items[DEVICE_STATS_BEVERAGE_PERIOD_COUNT][DEVICE_STATS_DRINK_KIND_COUNT] = {0};
 
 static const int s_beverage_period_days[DEVICE_STATS_BEVERAGE_PERIOD_COUNT] = {
     0,
@@ -366,16 +367,25 @@ static void device_statistics_add_beverage_event(uint8_t drink_id, int64_t now_m
     s_device_stats.blob.beverage_buckets[slot].total++;
     s_device_stats.blob.beverage_buckets[slot].drink_count[drink_id]++;
     s_device_stats.blob.backwash_count++;
-    s_device_stats.blob.descaling_water_count++;
 }
 
 static void device_statistics_report_updated(const char *reason)
 {
-    mqtt_schedule_device_status_sections_report(
-        MQTT_DEVICE_STATUS_SECTION_STATISTICS,
-        reason,
-        0U
-    );
+    if (!mqtt_request_immediate_device_status_sections_report(MQTT_DEVICE_STATUS_SECTION_STATISTICS,
+                                                              reason)) {
+        mqtt_schedule_device_status_sections_report(MQTT_DEVICE_STATUS_SECTION_STATISTICS,
+                                                    reason,
+                                                    0U);
+    }
+}
+
+static void device_statistics_add_descaling_water_usage(float water_volume)
+{
+    if (water_volume <= 0.0f) {
+        return;
+    }
+
+    s_device_stats.blob.descaling_water_count += (uint32_t)(water_volume + 0.5f);
 }
 
 static void device_statistics_finish_beverage_success(void)
@@ -388,6 +398,7 @@ static void device_statistics_finish_beverage_success(void)
     }
 
     s_device_stats.blob.total_extraction += delta;
+    device_statistics_add_descaling_water_usage(delta);
     device_statistics_add_beverage_event(s_session.drink_id, now_ms);
     device_statistics_mark_dirty();
     device_statistics_save();
@@ -398,9 +409,7 @@ static void device_statistics_finish_beverage_success(void)
              (double)delta,
              (double)s_device_stats.blob.total_extraction,
              (unsigned int)s_device_stats.blob.beverage_total);
-    mqtt_schedule_device_status_sections_report(MQTT_DEVICE_STATUS_SECTION_STATISTICS,
-                                                "beverage_statistics_updated",
-                                                0U);
+    device_statistics_report_updated("beverage_statistics_updated");
     device_statistics_reset_session();
 }
 
@@ -413,15 +422,14 @@ static void device_statistics_finish_water_success(void)
     }
 
     s_device_stats.blob.total_water += delta;
+    device_statistics_add_descaling_water_usage(delta);
     device_statistics_mark_dirty();
     device_statistics_save();
 
     ESP_LOGI(TAG, "stats water success delta=%.1f totalWater=%.1f",
              (double)delta,
              (double)s_device_stats.blob.total_water);
-    mqtt_schedule_device_status_sections_report(MQTT_DEVICE_STATUS_SECTION_STATISTICS,
-                                            "water_statistics_updated",
-                                            0U);             
+    device_statistics_report_updated("water_statistics_updated");
     device_statistics_reset_session();
 }
 
@@ -440,9 +448,7 @@ static void device_statistics_finish_grind_success(void)
     ESP_LOGI(TAG, "stats grind success delta=%.1f totalGrind=%.1f",
              (double)delta,
              (double)s_device_stats.blob.total_grind);
-    mqtt_schedule_device_status_sections_report(MQTT_DEVICE_STATUS_SECTION_STATISTICS,
-                                            "grind_statistics_updated",
-                                            0U);                  
+    device_statistics_report_updated("grind_statistics_updated");
     device_statistics_reset_session();
 }
 
@@ -464,18 +470,17 @@ static void device_statistics_finish_steam_success(void)
                  duration_ms,
                  DEVICE_STATS_STEAM_MIN_MS);
     }
-    mqtt_schedule_device_status_sections_report(MQTT_DEVICE_STATUS_SECTION_STATISTICS,
-                                            "steam_statistics_updated",
-                                            0U);     
+    device_statistics_report_updated("steam_statistics_updated");
     device_statistics_reset_session();
 }
 
-static void device_statistics_finish_maintain_success(app_state_t state)
+static void device_statistics_finish_maintain_success(app_state_t state, float water_volume)
 {
     switch (state) {
     case ST_MAINT_BREW:
         s_device_stats.blob.maintain_brew_count++;
         s_device_stats.blob.backwash_count = 0;
+        device_statistics_add_descaling_water_usage(water_volume);
         break;
     case ST_MAINT_DES:
         s_device_stats.blob.descaling_count++;
@@ -484,6 +489,7 @@ static void device_statistics_finish_maintain_success(app_state_t state)
     case ST_MAINT_STEAM:
         s_device_stats.blob.maintain_steam_count++;
         s_device_stats.blob.steam_clean_count = 0;
+        device_statistics_add_descaling_water_usage(water_volume);
         break;
     default:
         return;
@@ -500,9 +506,7 @@ static void device_statistics_finish_maintain_success(app_state_t state)
              (unsigned int)s_device_stats.blob.backwash_count,
              (unsigned int)s_device_stats.blob.steam_clean_count,
              (unsigned int)s_device_stats.blob.descaling_water_count);
-    mqtt_schedule_device_status_sections_report(MQTT_DEVICE_STATUS_SECTION_STATISTICS,
-                                            "maintain_statistics_updated",
-                                            0U);                  
+    device_statistics_report_updated("maintain_statistics_updated");
 }
 
 static void device_statistics_try_finish(device_stats_op_t op)
@@ -712,13 +716,13 @@ void device_statistics_notify_remote_cancel(void)
     device_statistics_reset_session();
 }
 
-void device_statistics_notify_maintain_success(app_state_t state)
+void device_statistics_notify_maintain_success(app_state_t state, float water_volume)
 {
     if (!s_device_stats.initialized) {
         return;
     }
 
-    device_statistics_finish_maintain_success(state);
+    device_statistics_finish_maintain_success(state, water_volume);
 }
 
 void device_statistics_handle_machine_status(const MACHINE_STATUS *status)

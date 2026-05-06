@@ -37,7 +37,7 @@ static const setting_param_desc_t g_params[] = {
     { ENCODER_MODE_HOT_WATER_WEIGHT, 5.0f,   400.0f, 5.0f, 0U },
     { ENCODER_MODE_HOT_WATER_TEMP,   40.0f,  95.0f, 5.0f, SETTING_PARAM_FLAG_TEMP },
     { ENCODER_MODE_GRIND_WEIGHT,     1.0f,   30.0f, 0.1f, SETTING_PARAM_FLAG_SINGLE_CLICK_EXIT },
-    { ENCODER_MODE_CLEAN_VOLUME,     10.0f,  100.0f, 1.0f, SETTING_PARAM_FLAG_SINGLE_CLICK_EXIT },
+    { ENCODER_MODE_CLEAN_VOLUME,     15.0f,  100.0f, 1.0f, SETTING_PARAM_FLAG_SINGLE_CLICK_EXIT },
     { ENCODER_MODE_STEAM_LEVEL,       1.0f,  2.0f, 1.0f, SETTING_PARAM_FLAG_SINGLE_CLICK_EXIT | SETTING_PARAM_FLAG_DISCRETE },
 };
 
@@ -50,7 +50,6 @@ static voice_id_t setting_current_water_in_voice(setting_water_in_t mode)
     case WATER_IN_MODE_BUCKET:
         return VOICE_CURRENTWATERBUCKETMODE;
 
-    case WATER_IN_MODE_NONE:
     default:
         return VOICE_NONE;
     }
@@ -65,7 +64,6 @@ static voice_id_t setting_switch_water_in_voice(setting_water_in_t mode)
     case WATER_IN_MODE_BUCKET:
         return VOICE_WATERBUCKETMODE;
 
-    case WATER_IN_MODE_NONE:
     default:
         return VOICE_NONE;
     }
@@ -121,13 +119,25 @@ static void setting_sync_water_in_mode(setting_water_in_t mode, bool push_ctr)
     mqtt_sync_runtime_setting_from_device();
 
     ESP_LOGI(TAG,
-             "Sync water-in mode local=%u factory=%d push_ctr=%d",
+             "Sync water-in mode local=%u factory=%d push_ctr=%d state=%d "
+             "ctr_status=%u shortage=%u error=%u",
              (unsigned)mode,
              water_supply_mode,
-             push_ctr ? 1 : 0);
+             push_ctr ? 1 : 0,
+             (int)g_ctx.core.state,
+             (unsigned)g_ctx.ms.ctr_status,
+             (unsigned)g_ctx.ms.water_box_shortage_flag,
+             (unsigned)g_ctx.ms.error_code);
 
     if (push_ctr && !ctr_cmd_action(CTRL_ACT_FACTORY_WRITE, NULL)) {
-        ESP_LOGW(TAG, "Water-in mode factory write rejected mode=%d", water_supply_mode);
+        ESP_LOGW(TAG,
+                 "Water-in mode factory write rejected local=%u factory=%d "
+                 "ctr_status=%u shortage=%u error=%u",
+                 (unsigned)mode,
+                 water_supply_mode,
+                 (unsigned)g_ctx.ms.ctr_status,
+                 (unsigned)g_ctx.ms.water_box_shortage_flag,
+                 (unsigned)g_ctx.ms.error_code);
     }
 }
 

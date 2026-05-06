@@ -90,6 +90,7 @@ typedef struct {
 } app_beverage_settings_t;
 
 typedef struct {
+    float display_scale;
     float display_offset_ml;
     float stop_ahead_ml;
 } drink_liquid_compensation_t;
@@ -98,6 +99,7 @@ typedef struct {
 typedef enum {
     BREW_SUB_PREPARE = 1,
     BREW_SUB_REMOTE_COUNTDOWN,
+    BREW_SUB_CANCEL_PENDING,
     BREW_SUB_RUNNING_1,
     BREW_SUB_RUNNING_2,
     BREW_SUB_FINISH,
@@ -448,9 +450,8 @@ typedef enum {
 } detection_result_flag_t;
 
 typedef enum {
-    WATER_IN_MODE_NONE = 0,
-    WATER_IN_MODE_TANK,
-    WATER_IN_MODE_BUCKET
+    WATER_IN_MODE_TANK = 0,
+    WATER_IN_MODE_BUCKET = 1,
 } setting_water_in_t;
 
 typedef enum {
@@ -639,12 +640,15 @@ typedef struct {
     float display_liquid_ml;
     uint8_t countdown_seconds;
     bool remote_active;
+    bool parallel_steam_active;
+    bool parallel_steam_preheating;
     bool tail_spray_pending;
     bool tail_spray_running;
 } app_drink_view_t;
 
 typedef struct {
     clear_bean_step_t step;
+    uint8_t countdown_seconds;
 } app_clear_bean_view_t;
 
 typedef struct {

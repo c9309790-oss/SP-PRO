@@ -3,6 +3,7 @@
 #include <string.h>
 #include "esp_err.h"
 #include "nvs.h"
+#include "nvs_retry.h"
 #include "mqtt_protocol_core.h"
 #include "ota_ctr.h"
 #include "uart_ctr.h"
@@ -23,17 +24,22 @@ typedef struct {
     bool reboot_replay_pending;
 } ota_last_result_report_t;
 
-static esp_err_t ota_last_result_store(ota_result_t result, const char *msg)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t err = nvs_open(OTA_LAST_RESULT_NVS, NVS_READWRITE, &nvs_handle);
+typedef struct {
+    ota_result_t result;
+    const char *msg;
+} ota_last_result_store_ctx_t;
 
-    if (err != ESP_OK) {
-        return err;
+static esp_err_t ota_last_result_write_to_nvs(nvs_handle_t nvs_handle, void *ctx)
+{
+    const ota_last_result_store_ctx_t *store_ctx = (const ota_last_result_store_ctx_t *)ctx;
+    esp_err_t err;
+
+    if (!store_ctx) {
+        return ESP_ERR_INVALID_ARG;
     }
 
     err = nvs_set_u8(nvs_handle, "valid", 1);
-    if (err == ESP_OK) err = nvs_set_u8(nvs_handle, "result", (uint8_t)result);
+    if (err == ESP_OK) err = nvs_set_u8(nvs_handle, "result", (uint8_t)store_ctx->result);
     if (err == ESP_OK) err = nvs_set_u8(nvs_handle, "replay", 0);
     if (err == ESP_OK) err = nvs_set_str(nvs_handle, "msgid", g_ota_info.ota_msgid);
     if (err == ESP_OK) err = nvs_set_str(nvs_handle, "dtype", g_ota_info.ota_dtype);
@@ -41,8 +47,59 @@ static esp_err_t ota_last_result_store(ota_result_t result, const char *msg)
     if (err == ESP_OK) err = nvs_set_str(nvs_handle, "fname", g_ota_info.ota_file_name);
     if (err == ESP_OK) err = nvs_set_str(nvs_handle, "md5", g_ota_info.ota_md5);
     if (err == ESP_OK) err = nvs_set_str(nvs_handle, "tkid", g_ota_info.ota_tkid);
-    if (err == ESP_OK) err = nvs_set_str(nvs_handle, "rmsg", msg ? msg : "Update_Fail");
+    if (err == ESP_OK) err = nvs_set_str(nvs_handle, "rmsg", store_ctx->msg ? store_ctx->msg : "Update_Fail");
+    return err;
+}
+
+static esp_err_t ota_last_result_replay_flag_write_to_nvs(nvs_handle_t nvs_handle, void *ctx)
+{
+    const bool *pending = (const bool *)ctx;
+
+    if (!pending) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return nvs_set_u8(nvs_handle, "replay", *pending ? 1U : 0U);
+}
+
+static esp_err_t ota_last_result_store(ota_result_t result, const char *msg)
+{
+    nvs_handle_t nvs_handle;
+    ota_last_result_store_ctx_t store_ctx = {
+        .result = result,
+        .msg = msg,
+    };
+    esp_err_t err = nvs_open(OTA_LAST_RESULT_NVS, NVS_READWRITE, &nvs_handle);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = ota_last_result_write_to_nvs(nvs_handle, &store_ctx);
     if (err == ESP_OK) err = nvs_commit(nvs_handle);
+
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        static const char *const keys[] = {
+            "valid",
+            "result",
+            "replay",
+            "msgid",
+            "dtype",
+            "stype",
+            "fname",
+            "md5",
+            "tkid",
+            "rmsg",
+        };
+        err = nvs_retry_rewrite_after_erasing_keys(nvs_handle,
+                                                   err,
+                                                   TAG,
+                                                   "ota last result",
+                                                   keys,
+                                                   sizeof(keys) / sizeof(keys[0]),
+                                                   ota_last_result_write_to_nvs,
+                                                   &store_ctx);
+    }
 
     nvs_close(nvs_handle);
     if (err == ESP_OK) {
@@ -143,6 +200,20 @@ static void ota_last_result_set_reboot_replay_pending(bool pending, const char *
     err = nvs_set_u8(nvs_handle, "replay", pending ? 1U : 0U);
     if (err == ESP_OK) {
         err = nvs_commit(nvs_handle);
+    }
+
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        static const char *const keys[] = {
+            "replay",
+        };
+        err = nvs_retry_rewrite_after_erasing_keys(nvs_handle,
+                                                   err,
+                                                   TAG,
+                                                   "ota replay flag",
+                                                   keys,
+                                                   sizeof(keys) / sizeof(keys[0]),
+                                                   ota_last_result_replay_flag_write_to_nvs,
+                                                   &pending);
     }
     nvs_close(nvs_handle);
 

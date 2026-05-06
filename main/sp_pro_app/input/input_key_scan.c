@@ -2,6 +2,28 @@
 #include "sp_pro_app.h"
 #include "sp_pro_app_state.h"
 #include "esp_log.h"
+#include <stddef.h>
+
+typedef struct {
+    uint8_t key_a;
+    uint8_t key_b;
+    key_combo_id_t combo_id;
+} key_combo_rule_t;
+
+static const key_combo_rule_t s_key_combo_rules[] = {
+    { KEY_GRIND,     KEY_TEMP,   KEY_COMBO_WATER_IN_MODE },
+    { KEY_CLEAN,     KEY_WIFI,   KEY_COMBO_CLEAR_PIPE },
+    { KEY_CHILD,     KEY_CLEAN,  KEY_COMBO_FACTORY_RESET },
+    { KEY_TEMP,      KEY_CHILD,  KEY_COMBO_WATER_HARDNESS },
+    { KEY_ESPRESSO,  KEY_STEAM,  KEY_COMBO_CAL_POWDER },
+    { KEY_AMERICANO, KEY_STEAM,  KEY_COMBO_CAL_FLOW },
+    { KEY_COLD_BREW, KEY_STEAM,  KEY_COMBO_DETECTION },
+#ifdef MAINT_TEST
+    { KEY_ESPRESSO,  KEY_CLEAN,  KEY_COMBO_MAINT_BREW },
+    { KEY_AMERICANO, KEY_CLEAN,  KEY_COMBO_MAINT_DES },
+    { KEY_COLD_BREW, KEY_CLEAN,  KEY_COMBO_MAINT_STEAM },
+#endif
+};
 
 static bool key_should_play_touch_tone(const app_ctx_t *ctx, int key_index)
 {
@@ -17,6 +39,120 @@ static bool key_should_play_touch_tone(const app_ctx_t *ctx, int key_index)
     return true;
 }
 
+static uint16_t key_combo_rule_mask(const key_combo_rule_t *rule)
+{
+    if (!rule) {
+        return 0U;
+    }
+
+    return (uint16_t)((1U << rule->key_a) | (1U << rule->key_b));
+}
+
+static bool key_combo_rule_is_down(const key_combo_rule_t *rule, uint16_t down_mask)
+{
+    uint16_t combo_mask = key_combo_rule_mask(rule);
+
+    return combo_mask != 0U && (down_mask & combo_mask) == combo_mask;
+}
+
+static bool key_combo_rule_is_ready(const app_ctx_t *ctx, const key_combo_rule_t *rule)
+{
+    if (!ctx || !rule) {
+        return false;
+    }
+
+    return ctx->input.key_time[rule->key_a] >= KEY_LONG_TICKS &&
+           ctx->input.key_time[rule->key_b] >= KEY_LONG_TICKS;
+}
+
+static bool key_combo_rule_is_release_ready(const app_ctx_t *ctx, const key_combo_rule_t *rule)
+{
+    if (!ctx || !rule) {
+        return false;
+    }
+
+    return ctx->input.key_time[rule->key_a] + 1U >= KEY_LONG_TICKS &&
+           ctx->input.key_time[rule->key_b] + 1U >= KEY_LONG_TICKS;
+}
+
+static bool key_combo_try_fire(app_ctx_t *ctx, const key_combo_rule_t *rule, const char *reason)
+{
+    uint16_t combo_mask;
+
+    if (!ctx || !rule || ctx->input.combo_lock_mask != 0U) {
+        return false;
+    }
+
+    combo_mask = key_combo_rule_mask(rule);
+    if (combo_mask == 0U) {
+        return false;
+    }
+
+    ctx->input.key_combo = rule->combo_id;
+    ctx->input.combo_lock_mask = 1U;
+    ctx->input.key_long &= (uint16_t)~combo_mask;
+    ctx->input.key_pressed &= (uint16_t)~combo_mask;
+    ctx->input.long_lock_mask |= combo_mask;
+
+    ESP_LOGI("key_scan",
+             "Combo detected id=%u reason=%s down=0x%04X time_a=%u time_b=%u",
+             (unsigned)rule->combo_id,
+             reason ? reason : "unknown",
+             (unsigned)ctx->input.key_down,
+             (unsigned)ctx->input.key_time[rule->key_a],
+             (unsigned)ctx->input.key_time[rule->key_b]);
+    return true;
+}
+
+static bool key_has_combo_partner_down(const app_ctx_t *ctx, uint8_t key_index)
+{
+    if (!ctx || key_index >= KEY_COUNT || ctx->input.combo_lock_mask != 0U) {
+        return false;
+    }
+
+    for (size_t i = 0; i < sizeof(s_key_combo_rules) / sizeof(s_key_combo_rules[0]); i++) {
+        const key_combo_rule_t *rule = &s_key_combo_rules[i];
+        uint8_t partner;
+
+        if (rule->key_a == key_index) {
+            partner = rule->key_b;
+        } else if (rule->key_b == key_index) {
+            partner = rule->key_a;
+        } else {
+            continue;
+        }
+
+        if ((ctx->input.key_down & (1U << partner)) != 0U) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void key_try_fire_release_combo(app_ctx_t *ctx, uint16_t old_mask)
+{
+    if (!ctx || ctx->input.combo_lock_mask != 0U) {
+        return;
+    }
+
+    for (size_t i = 0; i < sizeof(s_key_combo_rules) / sizeof(s_key_combo_rules[0]); i++) {
+        const key_combo_rule_t *rule = &s_key_combo_rules[i];
+
+        if (!key_combo_rule_is_down(rule, old_mask)) {
+            continue;
+        }
+
+        if (!key_combo_rule_is_release_ready(ctx, rule)) {
+            continue;
+        }
+
+        if (key_combo_try_fire(ctx, rule, "release")) {
+            return;
+        }
+    }
+}
+
 void key_scan_ticks(app_ctx_t *ctx)
 {
     if (!ctx) {
@@ -24,140 +160,58 @@ void key_scan_ticks(app_ctx_t *ctx)
     }
 
     for (int i = 0; i < KEY_COUNT; i++) {
-        if (ctx->input.key_down & (1 << i)) {
-            if (ctx->input.key_time[i] < 0xFFFF) {
-                ctx->input.key_time[i]++;
-            }
-
-            if (ctx->input.key_time[i] >= KEY_LONG_TICKS &&
-                (ctx->input.long_lock_mask & (1U << i)) == 0U) {
-                if (key_should_play_touch_tone(ctx, i)) {
-                    voice_manager_play_touch_tone();
-                }
-                ctx->input.key_long |= (1U << i);
-                ctx->input.long_lock_mask |= (1U << i);
-            }
+        if ((ctx->input.key_down & (1U << i)) == 0U) {
+            continue;
         }
+
+        if (ctx->input.key_time[i] < 0xFFFF) {
+            ctx->input.key_time[i]++;
+        }
+
+        if (ctx->input.key_time[i] < KEY_LONG_TICKS ||
+            (ctx->input.long_lock_mask & (1U << i)) != 0U) {
+            continue;
+        }
+
+        /* If a combo partner is still held, defer single-key long-press dispatch
+         * until combo arbitration finishes. This avoids entering a single-key
+         * page one tick before the intended combo becomes eligible. */
+        if (key_has_combo_partner_down(ctx, (uint8_t)i)) {
+            continue;
+        }
+
+        if (key_should_play_touch_tone(ctx, i)) {
+            voice_manager_play_touch_tone();
+        }
+        ctx->input.key_long |= (1U << i);
+        ctx->input.long_lock_mask |= (1U << i);
     }
 }
 
 void key_combo_tick(app_ctx_t *ctx)
 {
-    uint16_t down;
-
     if (!ctx) {
         return;
     }
 
-    down = ctx->input.key_down;
+    for (size_t i = 0; i < sizeof(s_key_combo_rules) / sizeof(s_key_combo_rules[0]); i++) {
+        const key_combo_rule_t *rule = &s_key_combo_rules[i];
 
-    /* K6 + K7 enters water intake mode selection. */
-    if ((down & ((1 << 5) | (1 << 6))) == ((1 << 5) | (1 << 6))) {
-        if (ctx->input.key_time[5] >= KEY_LONG_TICKS &&
-            ctx->input.key_time[6] >= KEY_LONG_TICKS &&
-            ctx->input.combo_lock_mask == 0U) {
-            ctx->input.key_combo = KEY_COMBO_WATER_IN_MODE;
-            ctx->input.combo_lock_mask = 1U;
+        if (!key_combo_rule_is_down(rule, ctx->input.key_down)) {
+            continue;
+        }
+
+        if (!key_combo_rule_is_ready(ctx, rule)) {
+            continue;
+        }
+
+        if (key_combo_try_fire(ctx, rule, "hold")) {
+            break;
         }
     }
-
-    /* K9 + K10 enters clear-pipe flow. */
-    if ((down & ((1 << 8) | (1 << 9))) == ((1 << 8) | (1 << 9))) {
-        if (ctx->input.key_time[8] >= KEY_LONG_TICKS &&
-            ctx->input.key_time[9] >= KEY_LONG_TICKS &&
-            ctx->input.combo_lock_mask == 0U) {
-            ctx->input.key_combo = KEY_COMBO_CLEAR_PIPE;
-            ctx->input.combo_lock_mask = 1U;
-        }
-    }
-
-    /* K8 + K9 enters factory-reset setting. */
-    if ((down & ((1 << 7) | (1 << 8))) == ((1 << 7) | (1 << 8))) {
-        if (ctx->input.key_time[7] >= KEY_LONG_TICKS &&
-            ctx->input.key_time[8] >= KEY_LONG_TICKS &&
-            ctx->input.combo_lock_mask == 0U) {
-            ctx->input.key_combo = KEY_COMBO_FACTORY_RESET;
-            ctx->input.combo_lock_mask = 1U;
-        }
-    }
-
-    /* K7 + K8 enters water-hardness setting. */
-    if ((down & ((1 << 6) | (1 << 7))) == ((1 << 6) | (1 << 7))) {
-        if (ctx->input.key_time[6] >= KEY_LONG_TICKS &&
-            ctx->input.key_time[7] >= KEY_LONG_TICKS &&
-            ctx->input.combo_lock_mask == 0U) {
-            ctx->input.key_combo = KEY_COMBO_WATER_HARDNESS;
-            ctx->input.combo_lock_mask = 1U;
-        }
-    }
-
-    /* K1 + K5 enters powder calibration. */
-    if ((down & ((1 << 0) | (1 << 4))) == ((1 << 0) | (1 << 4))) {
-        if (ctx->input.key_time[0] >= KEY_LONG_TICKS &&
-            ctx->input.key_time[4] >= KEY_LONG_TICKS &&
-            ctx->input.combo_lock_mask == 0U) {
-            ctx->input.key_combo = KEY_COMBO_CAL_POWDER;
-            ctx->input.combo_lock_mask = 1U;
-        }
-    }
-
-    /* K2 + K5 enters flow calibration. */
-    if ((down & ((1 << 1) | (1 << 4))) == ((1 << 1) | (1 << 4))) {
-        if (ctx->input.key_time[1] >= KEY_LONG_TICKS &&
-            ctx->input.key_time[4] >= KEY_LONG_TICKS &&
-            ctx->input.combo_lock_mask == 0U) {
-            ctx->input.key_combo = KEY_COMBO_CAL_FLOW;
-            ctx->input.combo_lock_mask = 1U;
-        }
-    }
-
-    /* K3 + K5 enters detection. */
-    if ((down & ((1 << 2) | (1 << 4))) == ((1 << 2) | (1 << 4))) {
-        if (ctx->input.key_time[2] >= KEY_LONG_TICKS &&
-            ctx->input.key_time[4] >= KEY_LONG_TICKS &&
-            ctx->input.combo_lock_mask == 0U) {
-            ctx->input.key_combo = KEY_COMBO_DETECTION;
-            ctx->input.combo_lock_mask = 1U;
-        }
-    }
-
-#ifdef MAINT_TEST
-    /* K9 + K1 enters brew maintenance test. */
-    if ((down & ((1 << 0) | (1 << 8))) == ((1 << 0) | (1 << 8))) {
-        if (ctx->input.key_time[0] >= KEY_LONG_TICKS &&
-            ctx->input.key_time[8] >= KEY_LONG_TICKS &&
-            ctx->input.combo_lock_mask == 0U) {
-            ESP_LOGI("key_scan", "Enter KEY_COMBO_MAINT_BREW");
-            ctx->input.key_combo = KEY_COMBO_MAINT_BREW;
-            ctx->input.combo_lock_mask = 1U;
-        }
-    }
-
-    /* K9 + K2 enters descaling maintenance test. */
-    if ((down & ((1 << 1) | (1 << 8))) == ((1 << 1) | (1 << 8))) {
-        if (ctx->input.key_time[1] >= KEY_LONG_TICKS &&
-            ctx->input.key_time[8] >= KEY_LONG_TICKS &&
-            ctx->input.combo_lock_mask == 0U) {
-            ESP_LOGI("key_scan", "Enter KEY_COMBO_MAINT_DES");
-            ctx->input.key_combo = KEY_COMBO_MAINT_DES;
-            ctx->input.combo_lock_mask = 1U;
-        }
-    }
-
-    /* K9 + K3 enters steam maintenance test. */
-    if ((down & ((1 << 2) | (1 << 8))) == ((1 << 2) | (1 << 8))) {
-        if (ctx->input.key_time[2] >= KEY_LONG_TICKS &&
-            ctx->input.key_time[8] >= KEY_LONG_TICKS &&
-            ctx->input.combo_lock_mask == 0U) {
-            ESP_LOGI("key_scan", "Enter KEY_COMBO_MAINT_STEAM");
-            ctx->input.key_combo = KEY_COMBO_MAINT_STEAM;
-            ctx->input.combo_lock_mask = 1U;
-        }
-    }
-#endif
 
     /* Allow a new combo after all keys are released. */
-    if (down == 0U) {
+    if (ctx->input.key_down == 0U) {
         ctx->input.combo_lock_mask = 0U;
     }
 }
@@ -174,17 +228,21 @@ void key_event_handle(app_ctx_t *ctx, const bf7613_key_event_t *event)
     new_mask = event->key_mask;
     old_mask = ctx->input.key_down;
 
+    /* If both keys already satisfied the combo hold condition, latch the combo
+     * before release ordering tears the chord apart. */
+    key_try_fire_release_combo(ctx, old_mask);
+
     for (int i = 0; i < KEY_COUNT; i++) {
-        bool now = (new_mask & (1 << i)) != 0;
-        bool last = (old_mask & (1 << i)) != 0;
+        bool now = (new_mask & (1U << i)) != 0U;
+        bool last = (old_mask & (1U << i)) != 0U;
 
         /* Reset hold time on key press edge. */
         if (now && !last) {
             if (key_should_play_touch_tone(ctx, i)) {
                 voice_manager_play_touch_tone();
             }
-            ctx->input.key_time[i] = 0;
-            ctx->input.long_lock_mask &= ~(1U << i);
+            ctx->input.key_time[i] = 0U;
+            ctx->input.long_lock_mask &= (uint16_t)~(1U << i);
         }
 
         /* Convert release edge into a short press only when long press has not fired. */
@@ -192,14 +250,13 @@ void key_event_handle(app_ctx_t *ctx, const bf7613_key_event_t *event)
             uint16_t held_ticks = ctx->input.key_time[i];
 
             if (held_ticks < KEY_LONG_TICKS) {
-                ctx->input.key_pressed |= (1 << i);
+                ctx->input.key_pressed |= (1U << i);
             }
 
-            ctx->input.key_time[i] = 0;
-            ctx->input.long_lock_mask &= ~(1U << i);
+            ctx->input.key_time[i] = 0U;
+            ctx->input.long_lock_mask &= (uint16_t)~(1U << i);
         }
     }
 
     ctx->input.key_down = new_mask;
 }
-

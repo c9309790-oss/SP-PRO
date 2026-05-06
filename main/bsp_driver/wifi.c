@@ -7,6 +7,7 @@
 #include "ota_ctr.h"
 #include "esp_log.h"
 #include "nvs.h"
+#include "nvs_retry.h"
 #include "ram_diag.h"
 #include <string.h>
 #include "system_runtime.h"
@@ -23,6 +24,27 @@ static const char *TAG = "wifi";
 uint16_t number = DEFAULT_SCAN_LIST_SIZE;
 wifi_ap_record_t ap_info[DEFAULT_SCAN_LIST_SIZE];
 uint8_t wifi_scan_flag=0;
+
+typedef struct {
+    const char *ssid;
+    const char *password;
+} wifi_nvs_save_ctx_t;
+
+static esp_err_t wifi_write_credentials_to_nvs(nvs_handle_t nvs_handle, void *ctx)
+{
+    const wifi_nvs_save_ctx_t *save_ctx = (const wifi_nvs_save_ctx_t *)ctx;
+    esp_err_t err;
+
+    if (!save_ctx) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = nvs_set_str(nvs_handle, "wifi_ssid", save_ctx->ssid);
+    if (err == ESP_OK) {
+        err = nvs_set_str(nvs_handle, "wifi_password", save_ctx->password);
+    }
+    return err;
+}
 static volatile wifi_scan_state_t s_wifi_scan_state = WIFI_SCAN_STATE_IDLE;
 static volatile bool s_wifi_reprovision_mode = false;
 static void wifi_scan_mark_state(wifi_scan_state_t state);
@@ -89,17 +111,11 @@ static void wifi_apply_credentials_and_connect(const char *ssid, const char *pas
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    err = esp_wifi_connect();
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to connect with updated Wi-Fi credentials: %s", esp_err_to_name(err));
-        ESP_ERROR_CHECK(err);
-    }
-
     save_wifi_info_to_nvs(wifi_ssid, wifi_password);
     read_wifi_info_from_nvs(wifi_ssid, wifi_password);
 
     ESP_LOGI(TAG,
-             "Applied Wi-Fi credentials and triggered connect ssid:%s reprovision=%d",
+             "Applied Wi-Fi credentials and restarted STA ssid:%s reprovision=%d",
              wifi_ssid,
              s_wifi_reprovision_mode);
 }
@@ -474,32 +490,42 @@ void read_wifi_info_from_nvs(char *ssid, char *password) {
 
 void save_wifi_info_to_nvs(const char *ssid, const char *password) {
     nvs_handle_t nvs_handle;
+    wifi_nvs_save_ctx_t save_ctx = {
+        .ssid = ssid,
+        .password = password,
+    };
     esp_err_t err = nvs_open(NVS_WIFI_CONFIG, NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Error (%s) opening NVS handle", esp_err_to_name(err));
         return;
     }
 
-    err = nvs_set_str(nvs_handle, "wifi_ssid", ssid);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error (%s) setting SSID in NVS", esp_err_to_name(err));
-        nvs_close(nvs_handle);
-        return;
+    err = wifi_write_credentials_to_nvs(nvs_handle, &save_ctx);
+
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
     }
 
-    err = nvs_set_str(nvs_handle, "wifi_password", password);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error (%s) setting password in NVS", esp_err_to_name(err));
-        nvs_close(nvs_handle);
-        return;
-    }
-
-    err = nvs_commit(nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error (%s) committing changes to NVS", esp_err_to_name(err));
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        static const char *const keys[] = {
+            "wifi_ssid",
+            "wifi_password",
+        };
+        err = nvs_retry_rewrite_after_erasing_keys(nvs_handle,
+                                                   err,
+                                                   TAG,
+                                                   "wifi credentials",
+                                                   keys,
+                                                   sizeof(keys) / sizeof(keys[0]),
+                                                   wifi_write_credentials_to_nvs,
+                                                   &save_ctx);
     }
 
     nvs_close(nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error (%s) saving Wi-Fi credentials to NVS", esp_err_to_name(err));
+        return;
+    }
     ESP_LOGI(TAG, "Wifi info saved to NVS %s %s", ssid, password);
 }
 
@@ -731,7 +757,7 @@ void WIFI_scan_task(void *pvParameters)
             }
             vTaskDelay(1);
         }
-        if (!s_wifi_reprovision_mode) {
+        if (!s_wifi_reprovision_mode && wifi_has_saved_credentials()) {
             reconnect_to_wifi();
         }
         ESP_LOGI(TAG, "Wifi scan finish , wifi_cnt=%d", wifi_cnt);

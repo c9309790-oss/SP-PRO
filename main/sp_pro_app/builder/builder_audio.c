@@ -56,6 +56,8 @@ static bool audio_initialized = false;
 static bool voice_req_pending = false;
 static bool s_touch_tone_pending = false;
 
+static void voice_manager_abort_current(void);
+
 static const voice_item_t voice_table[VOICE_MAX] = {
     [VOICE_NONE] = { NULL, 0 },
     [VOICE_PRSCHILDLOCK3S2UNLOCK] = { "PrsChildLock3s2Unlock.opus", 3 },
@@ -344,6 +346,25 @@ static bool voice_manager_start_request(voice_id_t id, bool send_to_front, uint8
     return voice_manager_enqueue_req(id, send_to_front, priority_override);
 }
 
+static bool voice_manager_reclaim_touch_tone_for_interrupt(voice_id_t id)
+{
+    if (!voice_id_is_valid(id) || !g_voice.busy || !voice_req_pending) {
+        return false;
+    }
+
+    if (g_voice.current_id != VOICE_KEY) {
+        return false;
+    }
+
+    ESP_LOGI(TAG,
+             "reclaim touch tone for interrupt voice current_id=%d next_id=%d",
+             (int)g_voice.current_id,
+             (int)id);
+    voice_manager_abort_current();
+    s_touch_tone_pending = false;
+    return true;
+}
+
 static void voice_manager_abort_current(void)
 {
     xQueueReset(voice_queue);
@@ -360,12 +381,9 @@ static bool voice_manager_request(voice_id_t id, bool allow_interrupt)
 {
     voice_policy_t next_policy;
     uint32_t now;
+    bool reclaimed_touch_tone = false;
 
     if (!audio_initialized || !voice_queue) {
-        return false;
-    }
-
-    if (!voice_manager_has_memory_headroom("prompt")) {
         return false;
     }
 
@@ -390,6 +408,9 @@ static bool voice_manager_request(voice_id_t id, bool allow_interrupt)
     }
 
     if (!voice_req_pending && !g_voice.busy) {
+        if (!voice_manager_has_memory_headroom("prompt")) {
+            return false;
+        }
         return voice_manager_start_request(id, false, 0);
     }
 
@@ -413,7 +434,17 @@ static bool voice_manager_request(voice_id_t id, bool allow_interrupt)
         }
     }
 
-    voice_manager_abort_current();
+    if (!voice_manager_has_memory_headroom("prompt")) {
+        reclaimed_touch_tone = voice_manager_reclaim_touch_tone_for_interrupt(id);
+        if (!reclaimed_touch_tone ||
+            !voice_manager_has_memory_headroom("prompt_after_reclaim")) {
+            return false;
+        }
+    }
+
+    if (!reclaimed_touch_tone) {
+        voice_manager_abort_current();
+    }
     return voice_manager_start_request(id, true, 0xFF);
 }
 

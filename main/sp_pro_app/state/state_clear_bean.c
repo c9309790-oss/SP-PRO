@@ -9,6 +9,7 @@ static const char *TAG = "state_clear_bean";
 
 #define CLEAR_BEAN_LOADING_TICKS     STAY_TICKS(10000)
 #define CLEAR_BEAN_RUN_TICKS         STAY_TICKS(5000)
+#define CLEAR_BEAN_RESET_GRACE_TICKS STAY_TICKS(5000)
 #define CLEAR_BEAN_STATUS_ABLE_TO_CLEAR 2U
 
 static bool clear_bean_is_able_to_clear(const app_ctx_t *ctx)
@@ -27,12 +28,17 @@ bool clear_bean_should_enter(const app_ctx_t *ctx)
         return false;
     }
 
-    return clear_bean_is_able_to_clear(ctx);
+    return clear_bean_is_able_to_clear(ctx) &&
+           !ctx->state_runtime.clear_bean.post_clean_notice_pending;
 }
 
 bool clear_bean_should_suppress_hopper_notice(const app_ctx_t *ctx)
 {
     if (!ctx) {
+        return false;
+    }
+
+    if (ctx->state_runtime.clear_bean.post_clean_notice_pending) {
         return false;
     }
 
@@ -72,6 +78,8 @@ static void clear_bean_reset(app_ctx_t *ctx)
     ctx->clear_bean.step = CLEAR_BEAN_STEP_NONE;
     ctx->clear_bean.step_tick = 0U;
     ctx->state_runtime.clear_bean.entered = false;
+    ctx->state_runtime.clear_bean.done_voice_stage = 0U;
+    ctx->state_runtime.clear_bean.done_grace_tick = 0U;
 }
 
 static void clear_bean_maybe_play_voice(app_ctx_t *ctx)
@@ -82,7 +90,7 @@ static void clear_bean_maybe_play_voice(app_ctx_t *ctx)
 
     switch (ctx->clear_bean.step) {
     case CLEAR_BEAN_STEP_DISPLACED:
-        voice_manager_interval(VOICE_ALERTBEANBINDISPLACED, 5000U);
+        voice_manager_interval(VOICE_BEANHOPPERMISSING, 5000U);
         break;
 
     case CLEAR_BEAN_STEP_WAIT_HANDLE:
@@ -115,6 +123,11 @@ app_state_t state_handle_clear_bean(app_ctx_t *ctx)
         return ST_READY;
     }
 
+    if (ctx->state_runtime.clear_bean.post_clean_notice_pending) {
+        clear_bean_reset(ctx);
+        return ST_READY;
+    }
+
     if (!ctx->state_runtime.clear_bean.entered) {
         ctx->state_runtime.clear_bean.entered = true;
         ctx->clear_bean.step = CLEAR_BEAN_STEP_NONE;
@@ -144,6 +157,17 @@ app_state_t state_handle_clear_bean(app_ctx_t *ctx)
     }
 
     if (ctx->clear_bean.step == CLEAR_BEAN_STEP_UNLOCK_HINT) {
+        if (!handle_present) {
+            ESP_LOGI(TAG,
+                     "wait handle before clear bean start grindHandle=%u",
+                     (unsigned)ctx->ms.grind_handle_postion_flag);
+            clear_bean_enter_step(ctx, CLEAR_BEAN_STEP_WAIT_HANDLE);
+            clear_bean_maybe_play_voice(ctx);
+            ctx->input.key_pressed = 0;
+            ctx->input.key_long = 0;
+            return ST_CLEAR_BEAN;
+        }
+
         clear_bean_enter_step(ctx, CLEAR_BEAN_STEP_WAIT_RUN_DELAY);
         ctx->input.key_pressed = 0;
         ctx->input.key_long = 0;
@@ -152,6 +176,9 @@ app_state_t state_handle_clear_bean(app_ctx_t *ctx)
 
     if (ctx->clear_bean.step == CLEAR_BEAN_STEP_WAIT_RUN_DELAY) {
         if (!handle_present) {
+            ESP_LOGI(TAG,
+                     "clear bean paused waiting handle during delay grindHandle=%u",
+                     (unsigned)ctx->ms.grind_handle_postion_flag);
             clear_bean_maybe_play_voice(ctx);
         }
 
@@ -172,6 +199,10 @@ app_state_t state_handle_clear_bean(app_ctx_t *ctx)
     }
 
     if (!handle_present) {
+        ESP_LOGI(TAG,
+                 "clear bean waiting handle before grinder run grindHandle=%u step=%d",
+                 (unsigned)ctx->ms.grind_handle_postion_flag,
+                 (int)ctx->clear_bean.step);
         clear_bean_stop_grinder(ctx);
         clear_bean_enter_step(ctx, CLEAR_BEAN_STEP_WAIT_HANDLE);
         clear_bean_maybe_play_voice(ctx);
@@ -180,8 +211,16 @@ app_state_t state_handle_clear_bean(app_ctx_t *ctx)
         return ST_CLEAR_BEAN;
     }
 
+    if (ctx->clear_bean.step == CLEAR_BEAN_STEP_DISPLACED) {
+        clear_bean_maybe_play_voice(ctx);
+        ctx->input.key_pressed = 0;
+        ctx->input.key_long = 0;
+        return ST_CLEAR_BEAN;
+    }
+
     if (ctx->clear_bean.step != CLEAR_BEAN_STEP_RUNNING &&
         ctx->clear_bean.step != CLEAR_BEAN_STEP_DONE &&
+        ctx->clear_bean.step != CLEAR_BEAN_STEP_DISPLACED &&
         voice_play_is_busy()) {
         ctx->input.key_pressed = 0;
         ctx->input.key_long = 0;
@@ -189,7 +228,8 @@ app_state_t state_handle_clear_bean(app_ctx_t *ctx)
     }
 
     if (ctx->clear_bean.step != CLEAR_BEAN_STEP_RUNNING &&
-        ctx->clear_bean.step != CLEAR_BEAN_STEP_DONE) {
+        ctx->clear_bean.step != CLEAR_BEAN_STEP_DONE &&
+        ctx->clear_bean.step != CLEAR_BEAN_STEP_DISPLACED) {
         clear_bean_start_grinder(ctx);
         ctx->input.key_pressed = 0;
         ctx->input.key_long = 0;
@@ -200,20 +240,62 @@ app_state_t state_handle_clear_bean(app_ctx_t *ctx)
         (ctx->timer.tick - ctx->clear_bean.step_tick >= CLEAR_BEAN_RUN_TICKS)) {
         clear_bean_stop_grinder(ctx);
         clear_bean_enter_step(ctx, CLEAR_BEAN_STEP_DONE);
-        voice_manager_play(VOICE_KEY);
+        ctx->state_runtime.clear_bean.done_voice_stage = 0U;
+        ctx->state_runtime.clear_bean.done_grace_tick = ctx->timer.tick;
         ctx->input.key_pressed = 0;
         ctx->input.key_long = 0;
         return ST_CLEAR_BEAN;
     }
 
     if (ctx->clear_bean.step == CLEAR_BEAN_STEP_DONE) {
-        if (voice_play_is_busy()) {
+        if (ctx->state_runtime.clear_bean.done_voice_stage == 0U) {
+            if (!voice_play_is_busy()) {
+                /* TODO(product): replace this fallback with the dedicated
+                 * "clear bean finished" prompt once PM provides the final
+                 * voice asset/phrase. */
+                (void)voice_manager_play(VOICE_CLEANFINISHED);
+                ctx->state_runtime.clear_bean.done_voice_stage = 1U;
+            }
             ctx->input.key_pressed = 0;
             ctx->input.key_long = 0;
             return ST_CLEAR_BEAN;
         }
 
+        if (ctx->state_runtime.clear_bean.done_voice_stage == 1U) {
+            if (!voice_play_is_busy()) {
+                (void)voice_manager_play(VOICE_PUTBACKBEANHOPPER);
+                ctx->state_runtime.clear_bean.done_voice_stage = 2U;
+            }
+            ctx->input.key_pressed = 0;
+            ctx->input.key_long = 0;
+            return ST_CLEAR_BEAN;
+        }
+
+        if (ctx->state_runtime.clear_bean.done_voice_stage == 2U) {
+            if (voice_play_is_busy()) {
+                ctx->input.key_pressed = 0;
+                ctx->input.key_long = 0;
+                return ST_CLEAR_BEAN;
+            }
+
+            ctx->state_runtime.clear_bean.done_voice_stage = 3U;
+        }
+
+        if ((ctx->timer.tick - ctx->state_runtime.clear_bean.done_grace_tick) <
+            CLEAR_BEAN_RESET_GRACE_TICKS) {
+            ctx->input.key_pressed = 0;
+            ctx->input.key_long = 0;
+            return ST_CLEAR_BEAN;
+        }
+
+        ESP_LOGI(TAG,
+                 "clear bean finished but hopper not relocked within grace tick=%lu beanbox=%u -> bean miss notice",
+                 (unsigned long)ctx->timer.tick,
+                 (unsigned)ctx->ms.beanbox_in_place);
+        ctx->state_runtime.clear_bean.post_clean_notice_pending = true;
         clear_bean_reset(ctx);
+        ctx->input.key_pressed = 0;
+        ctx->input.key_long = 0;
         return ST_READY;
     }
 

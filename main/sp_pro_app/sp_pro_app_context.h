@@ -84,6 +84,12 @@ typedef struct {
         float grind_w;
         float clean_v;
         float steam_level;
+        float hot_drink_display_scale_delta;
+        float hot_drink_display_offset_delta;
+        float hot_drink_stop_ahead_delta;
+        float hot_water_display_scale_delta;
+        float hot_water_display_offset_delta;
+        float hot_water_stop_ahead_delta;
 
         bool active;
         uint8_t drink_type;
@@ -177,15 +183,19 @@ typedef struct {
             bool grind_notice_pause_sent;
             bool grind_resume_pending;
             bool remote_action_started;
+            bool force_target_display_active;
             bool liquid_output_seen;
             bool finish_wait_none_started;
+            bool cancel_pending_ignore_flow;
             bool water_idle_seen_after_start;
             float grind_resume_remaining_g;
             float liquid_session_base_ml;
             float display_liquid_base_ml;
             float display_liquid_ml;
             float display_flow_rate_ml_s;
+            float force_target_display_ml;
             float water_start_liquid_ml;
+            uint32_t target_display_cap_tick;
             uint32_t grind_resume_pause_tick;
             uint32_t finish_wait_tick;
             uint32_t last_encoder_evt_seq;
@@ -193,6 +203,8 @@ typedef struct {
             uint32_t last_steam_log_sec;
             uint8_t last_steam_flag;
             uint8_t water_start_hot_flag;
+            bool parallel_steam_active;
+            uint32_t parallel_steam_start_tick;
             drink_exit_reason_t exit_reason;
         } drink;
 
@@ -237,6 +249,7 @@ typedef struct {
             uint8_t steam_click_count;
             uint32_t steam_click_deadline;
             uint32_t steam_not_ready_notice_deadline;
+            uint32_t clear_bean_unlock_tick;
         } ready;
 
         struct {
@@ -263,11 +276,21 @@ typedef struct {
         struct {
             bool entered;
             bool grinder_started;
+            bool post_clean_notice_pending;
+            uint8_t done_voice_stage;
+            uint32_t done_grace_tick;
         } clear_bean;
 
         struct {
+            bool factory_write_sent;
+            bool factory_read_sent;
+            bool first_powered_on_checked;
+            bool replenish_required;
             bool replenish_cmd_sent;
             bool replenish_activity_seen;
+            uint32_t factory_write_tick;
+            uint32_t factory_read_tick;
+            uint32_t last_factory_poll_tick;
             uint32_t replenish_tick;
             uint32_t phase_tick;
             uint32_t last_diag_tick;

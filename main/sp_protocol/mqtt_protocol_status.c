@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "nvs.h"
 #include "mqtt.h"
 #include "mqtt_protocol_core.h"
 #include "mqtt_protocol_codec.h"
@@ -10,6 +11,7 @@
 #include "device_statistics_store.h"
 #include "mqtt_protocol.h"
 #include "sp_pro_app_ctrl.h"
+#include "nvs_retry.h"
 #include "wifi.h"
 
 static mqtt_device_status_provider_t s_device_status_provider = NULL;
@@ -17,6 +19,22 @@ static const char *TAG = "MQTT_STATUS";
 #define MQTT_TEST_TRIM_STATUS_STATISTICS 0
 #define MQTT_TEST_TRIM_STATUS_FORMULA_OVERALL 0
 #define MQTT_FORMULA_REPORT_LABEL "DEFAULT"
+#define MQTT_CALIBRATION_DEFAULT_LIQUID_K      0.0f
+#define MQTT_CALIBRATION_DEFAULT_LIQUID_B      0.0f
+#define MQTT_CALIBRATION_DEFAULT_FLOWMETER_ADC 0.45f
+#define MQTT_RUNTIME_SETTING_NVS_NAMESPACE "mqtt_runtime"
+#define MQTT_RUNTIME_SETTING_NVS_KEY "setting"
+#define MQTT_RUNTIME_SETTING_MAGIC 0x4D515254UL
+#define MQTT_RUNTIME_SETTING_VERSION 1U
+static char s_next_formula_overall_report_msg_id[64] = {0};
+static bool s_runtime_setting_loaded = false;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    setting_info_t setting;
+} mqtt_runtime_setting_blob_t;
 
 static clean_result_info_t s_clean_result = {
     .steam_pole_cleaning = 1,
@@ -81,13 +99,13 @@ static void mqtt_apply_formula_report_runtime_override(formula_info_t *formula,
 
     switch (formula->drink_id) {
     case DRINK_ID_ESPRESSO:
-        formula->grind_weight = (uint16_t)(settings->grind_w + 0.5f);
+        formula->grind_weight = settings->grind_w;
         formula->preset_temperature = (uint16_t)(settings->esp_brew_t + 0.5f);
         formula->preset_liquid_weight = (uint16_t)(settings->esp_brew_w + 0.5f);
         break;
 
     case DRINK_ID_AMERICAN:
-        formula->grind_weight = (uint16_t)(settings->grind_w + 0.5f);
+        formula->grind_weight = settings->grind_w;
         formula->preset_temperature = (uint16_t)(settings->ame_brew_t + 0.5f);
         formula->preset_liquid_weight = (uint16_t)(settings->ame_brew_w + 0.5f);
         formula->water_temperature = (uint16_t)(settings->ame_water_t + 0.5f);
@@ -95,14 +113,14 @@ static void mqtt_apply_formula_report_runtime_override(formula_info_t *formula,
         break;
 
     case DRINK_ID_COLDBREW:
-        formula->grind_weight = (uint16_t)(settings->grind_w + 0.5f);
+        formula->grind_weight = settings->grind_w;
         formula->preset_temperature = 0U;
         formula->preset_liquid_weight = (uint16_t)(settings->cold_brew_w + 0.5f);
         formula->water_weight = (uint16_t)(settings->cold_brew_w + 0.5f);
         break;
 
     case DRINK_ID_WATER:
-        formula->grind_weight = 0U;
+        formula->grind_weight = 0.0f;
         formula->grind_range = 0U;
         formula->preset_temperature = 0U;
         formula->preset_liquid_weight = 0U;
@@ -128,27 +146,11 @@ static void mqtt_apply_formula_report_runtime_override(formula_info_t *formula,
 static cJSON *mqtt_create_formula_report_json(const formula_info_t *formula, bool is_player_formula)
 {
     cJSON *item;
-    cJSON *label_id;
-    cJSON *label;
 
     item = is_player_formula ? mqtt_create_formula_list_json(formula)
                              : mqtt_create_formula_json(formula);
     if (!item) {
         return cJSON_CreateObject();
-    }
-
-    label_id = cJSON_GetObjectItem(item, "labelId");
-    if (label_id) {
-        cJSON_SetIntValue(label_id, -1);
-    } else {
-        cJSON_AddNumberToObject(item, "labelId", -1);
-    }
-
-    label = cJSON_GetObjectItem(item, "label");
-    if (label) {
-        cJSON_SetValuestring(label, MQTT_FORMULA_REPORT_LABEL);
-    } else {
-        cJSON_AddStringToObject(item, "label", MQTT_FORMULA_REPORT_LABEL);
     }
 
     return item;
@@ -158,11 +160,6 @@ static cJSON *mqtt_create_formula_intel_report_json(const formula_info_t *formul
 {
     app_command_view_t settings = {0};
     formula_info_t report_formula;
-    const char *formula_name;
-    const char *drink_name;
-    int report_id;
-    cJSON *item;
-    cJSON *pressure_stage_arr;
 
     if (!formula) {
         return cJSON_CreateObject();
@@ -171,47 +168,7 @@ static cJSON *mqtt_create_formula_intel_report_json(const formula_info_t *formul
     sp_pro_app_get_command_view(&settings);
     report_formula = *formula;
     mqtt_apply_formula_report_runtime_override(&report_formula, &settings);
-
-    formula_name = mqtt_formula_report_name(report_formula.drink_id);
-    drink_name = mqtt_formula_report_drink_name(report_formula.drink_id);
-    report_id = mqtt_formula_report_record_id(report_formula.drink_id);
-
-    item = cJSON_CreateObject();
-    cJSON_AddStringToObject(item, "formulaName",
-                            (formula_name && formula_name[0] != '\0') ? formula_name : report_formula.formula_name);
-    cJSON_AddNumberToObject(item, "drinkId", report_formula.drink_id);
-    cJSON_AddNumberToObject(item, "presetLiquidWeight", report_formula.preset_liquid_weight);
-    cJSON_AddNumberToObject(item, "presetTemperature", report_formula.preset_temperature);
-    cJSON_AddStringToObject(item, "label", MQTT_FORMULA_REPORT_LABEL);
-
-    pressure_stage_arr = cJSON_CreateArray();
-    if (report_formula.pressure_stage_cnt > 0) {
-        for (int i = 0; i < report_formula.pressure_stage_cnt; i++) {
-            cJSON *stage = cJSON_CreateObject();
-            cJSON_AddNumberToObject(stage, "pressure", report_formula.pressure_stage[i].pressure);
-            cJSON_AddNumberToObject(stage, "waitTime", report_formula.pressure_stage[i].wait_time);
-            cJSON_AddItemToArray(pressure_stage_arr, stage);
-        }
-    } else if (report_formula.drink_id == DRINK_ID_ESPRESSO) {
-        cJSON *stage = cJSON_CreateObject();
-        cJSON_AddNumberToObject(stage, "pressure", 9);
-        cJSON_AddNumberToObject(stage, "waitTime", 0);
-        cJSON_AddItemToArray(pressure_stage_arr, stage);
-    }
-    cJSON_AddItemToObject(item, "pressureStage", pressure_stage_arr);
-
-    cJSON_AddNumberToObject(item, "grindRange", 0);
-    cJSON_AddStringToObject(item, "drinkName",
-                            (drink_name && drink_name[0] != '\0') ? drink_name : report_formula.drink_name);
-    cJSON_AddStringToObject(item, "formulaRemark", "");
-    cJSON_AddNumberToObject(item, "recordId", report_id);
-    cJSON_AddNumberToObject(item, "formulaId", report_id);
-    cJSON_AddNumberToObject(item, "labelId", -1);
-    cJSON_AddNumberToObject(item, "grindWeight", report_formula.grind_weight);
-    cJSON_AddNumberToObject(item, "waterTemperature", report_formula.water_temperature);
-    cJSON_AddNumberToObject(item, "waterWeight", report_formula.water_weight);
-    cJSON_AddNumberToObject(item, "milkTemperature", report_formula.milk_temperature);
-    return item;
+    return mqtt_create_formula_json(&report_formula);
 }
 
 setting_info_t mqtt_runtime_setting = {
@@ -235,22 +192,97 @@ static void publish_device_status_to_mqtt_internal(const device_status_message_t
                                                    uint32_t section_mask);
 static void mqtt_report_device_status_internal(uint32_t section_mask,
                                                const char *reason);
+static void mqtt_load_runtime_setting_once(void);
+
+static esp_err_t mqtt_runtime_setting_rewrite_to_nvs(nvs_handle_t nvs_handle, void *ctx)
+{
+    const mqtt_runtime_setting_blob_t *blob = (const mqtt_runtime_setting_blob_t *)ctx;
+
+    if (!blob) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return nvs_set_blob(nvs_handle, MQTT_RUNTIME_SETTING_NVS_KEY, blob, sizeof(*blob));
+}
+
+void mqtt_set_next_formula_overall_report_msg_id(const char *msg_id)
+{
+    if (msg_id && msg_id[0] != '\0') {
+        mqtt_copy_string(s_next_formula_overall_report_msg_id,
+                         sizeof(s_next_formula_overall_report_msg_id),
+                         msg_id,
+                         NULL);
+    } else {
+        s_next_formula_overall_report_msg_id[0] = '\0';
+    }
+}
 
 const setting_info_t *mqtt_get_runtime_setting(void)
 {
+    mqtt_load_runtime_setting_once();
     return &mqtt_runtime_setting;
+}
+
+static void mqtt_load_runtime_setting_once(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+    mqtt_runtime_setting_blob_t blob = {0};
+    size_t size = sizeof(blob);
+
+    if (s_runtime_setting_loaded) {
+        return;
+    }
+
+    s_runtime_setting_loaded = true;
+
+    err = nvs_open(MQTT_RUNTIME_SETTING_NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "runtime setting nvs_open skipped: %s", esp_err_to_name(err));
+        mqtt_normalize_runtime_setting();
+        return;
+    }
+
+    err = nvs_get_blob(nvs_handle, MQTT_RUNTIME_SETTING_NVS_KEY, &blob, &size);
+    nvs_close(nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "runtime setting load skipped: %s", esp_err_to_name(err));
+        mqtt_normalize_runtime_setting();
+        return;
+    }
+
+    if (size != sizeof(blob) ||
+        blob.magic != MQTT_RUNTIME_SETTING_MAGIC ||
+        blob.version != MQTT_RUNTIME_SETTING_VERSION) {
+        ESP_LOGW(TAG,
+                 "runtime setting blob invalid size=%u magic=0x%08lx version=%u",
+                 (unsigned)size,
+                 (unsigned long)blob.magic,
+                 (unsigned)blob.version);
+        mqtt_normalize_runtime_setting();
+        return;
+    }
+
+    mqtt_runtime_setting = blob.setting;
+    mqtt_normalize_runtime_setting();
+    ESP_LOGI(TAG, "runtime setting loaded from NVS");
 }
 
 void mqtt_normalize_runtime_setting(void)
 {
+    /* Factory / validation builds should keep prompts enabled so H-alarm
+     * verification is not affected by stale runtime settings from MQTT. */
+    mqtt_runtime_setting.voice_touch_tone = 1;
+    mqtt_runtime_setting.voice_prompt = 1;
+
     if (mqtt_runtime_setting.auto_power_off_time > 0 &&
         mqtt_runtime_setting.auto_stand_by_time > 0 &&
         mqtt_runtime_setting.auto_stand_by_time > mqtt_runtime_setting.auto_power_off_time) {
         mqtt_runtime_setting.auto_stand_by_time = mqtt_runtime_setting.auto_power_off_time;
     }
 
-    if (mqtt_runtime_setting.voice_volume < 0) {
-        mqtt_runtime_setting.voice_volume = 0;
+    if (mqtt_runtime_setting.voice_volume <= 0) {
+        mqtt_runtime_setting.voice_volume = 3;
     } else if (mqtt_runtime_setting.voice_volume > 5) {
         mqtt_runtime_setting.voice_volume = 5;
     }
@@ -263,6 +295,7 @@ void mqtt_register_device_status_provider(mqtt_device_status_provider_t provider
 
 void mqtt_sync_runtime_setting_from_device(void)
 {
+    mqtt_load_runtime_setting_once();
     mqtt_runtime_setting.factory_status = factory_data.first_powered_on ? 1 : mqtt_runtime_setting.factory_status;
 
     if (g_ota_info.ota_auto_up[0] == '0' || g_ota_info.ota_auto_up[0] == '1')
@@ -277,6 +310,7 @@ void mqtt_sync_runtime_setting_from_device(void)
 
 void mqtt_restore_local_defaults(void)
 {
+    mqtt_load_runtime_setting_once();
     mqtt_runtime_setting.auto_power_off_time = 1800;
     mqtt_runtime_setting.auto_stand_by_time = 1800;
     mqtt_runtime_setting.voice_touch_tone = 1;
@@ -292,6 +326,7 @@ void mqtt_restore_local_defaults(void)
 
     sp_pro_app_restore_default_settings();
     factory_data.water_supply_mode = 0;
+    (void)mqtt_save_runtime_setting();
 }
 
 static void mqtt_set_clean_result_value(int cleaning_mode, int value)
@@ -309,6 +344,55 @@ static void mqtt_set_clean_result_value(int cleaning_mode, int value)
     default:
         break;
     }
+}
+
+bool mqtt_save_runtime_setting(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+    mqtt_runtime_setting_blob_t blob = {
+        .magic = MQTT_RUNTIME_SETTING_MAGIC,
+        .version = MQTT_RUNTIME_SETTING_VERSION,
+        .reserved = 0U,
+        .setting = mqtt_runtime_setting,
+    };
+
+    mqtt_normalize_runtime_setting();
+
+    err = nvs_open(MQTT_RUNTIME_SETTING_NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "runtime setting nvs_open failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    err = nvs_set_blob(nvs_handle, MQTT_RUNTIME_SETTING_NVS_KEY, &blob, sizeof(blob));
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
+    }
+
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        static const char *const keys[] = {
+            MQTT_RUNTIME_SETTING_NVS_KEY,
+        };
+        err = nvs_retry_rewrite_after_erasing_keys(nvs_handle,
+                                                   err,
+                                                   TAG,
+                                                   "runtime setting",
+                                                   keys,
+                                                   sizeof(keys) / sizeof(keys[0]),
+                                                   mqtt_runtime_setting_rewrite_to_nvs,
+                                                   &blob);
+    }
+    nvs_close(nvs_handle);
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "runtime setting save failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    s_runtime_setting_loaded = true;
+    ESP_LOGI(TAG, "runtime setting saved to NVS");
+    return true;
 }
 
 void mqtt_mark_clean_result_incomplete(int cleaning_mode)
@@ -355,8 +439,10 @@ int mqtt_get_task_status(void)
 {
     app_state_t app_state = sp_pro_app_get_state();
 
-    if (g_ota_info.ota_sta > IOT_SIMPEL_OTA_NULL &&
-        g_ota_info.ota_sta < IOT_SIMPLE_OTA_SUCCESS)
+    /* Only report OTA taskStatus=8 when the controller is actually applying
+     * the upgrade payload. Downloaded / verified / wait-confirm phases should
+     * fall back to the normal machine task status. */
+    if (g_ota_info.ota_sta == IOT_SIMPLE_OTA_YMODEM)
     {
         return 8;
     }
@@ -381,6 +467,7 @@ int mqtt_get_task_status(void)
     case ST_WIFI:
         return 0;
 
+    case ST_MASTER:
     case ST_ESPRESSO:
     case ST_AMERICANO:
     case ST_COLD_BREW:
@@ -425,7 +512,6 @@ static int mqtt_fill_default_sensors(sensor_info_t *sensors, int max_sensors)
     mqtt_set_sensor_status_testable(&sensors[idx++], "grind_handle_postion_flag", machine_status.grind_handle_postion_flag ? 0 : 1);
     mqtt_set_sensor_status_testable(&sensors[idx++], "brew_handle_postion_flag", machine_status.brew_handle_postion_flag ? 0 : 1);
     mqtt_set_sensor_status_testable(&sensors[idx++], "water_box_shortage_flag", machine_status.water_box_shortage_flag);
-    mqtt_set_sensor_status_testable(&sensors[idx++], "WATER_PUMP_WARN", machine_status.water_box_shortage_flag);
     mqtt_set_sensor_status_testable(&sensors[idx++], "WATER_PUMP_ERROR", (machine_status.error_code & WATER_PUMP_ERROR) ? 1 : 0);
     mqtt_set_sensor_status_testable(&sensors[idx++], "WATER_WAY_ERROR", (machine_status.error_code & WATER_WAY_ERROR) ? 1 : 0);
     mqtt_set_sensor_status_testable(&sensors[idx++], "BREW_HEAT_PLATE_ERROR", (machine_status.error_code & BREW_HEAT_PLATE_ERROR) ? 1 : 0);
@@ -459,9 +545,9 @@ static void mqtt_fill_default_calibration(calibration_info_t *calibration)
 
     snprintf(calibration->powder_k, sizeof(calibration->powder_k), "%.8f", factory_data.powder_k_value);
     snprintf(calibration->powder_b, sizeof(calibration->powder_b), "%.8f", factory_data.powder_b_value);
-    snprintf(calibration->liquid_k, sizeof(calibration->liquid_k), "%.8f", factory_data.liquid_k_value);
-    snprintf(calibration->liquid_b, sizeof(calibration->liquid_b), "%.8f", factory_data.liquid_b_value);
-    snprintf(calibration->flow_meter_adc, sizeof(calibration->flow_meter_adc), "%.8f", factory_data.flowmeter_coff);
+    snprintf(calibration->liquid_k, sizeof(calibration->liquid_k), "%.8f", MQTT_CALIBRATION_DEFAULT_LIQUID_K);
+    snprintf(calibration->liquid_b, sizeof(calibration->liquid_b), "%.8f", MQTT_CALIBRATION_DEFAULT_LIQUID_B);
+    snprintf(calibration->flow_meter_adc, sizeof(calibration->flow_meter_adc), "%.8f", MQTT_CALIBRATION_DEFAULT_FLOWMETER_ADC);
 }
 
 static void mqtt_fill_default_setting(setting_info_t *setting)
@@ -619,6 +705,21 @@ static void mqtt_report_device_status_internal(uint32_t section_mask,
              status.device_info.sensors_count,
              include_formula_overall,
              include_statistics);
+
+    if (include_formula_overall &&
+        effective_section_mask == MQTT_DEVICE_STATUS_SECTION_FORMULA_OVERALL &&
+        s_next_formula_overall_report_msg_id[0] != '\0') {
+        mqtt_copy_string(status.msg_id,
+                         sizeof(status.msg_id),
+                         s_next_formula_overall_report_msg_id,
+                         NULL);
+        ESP_LOGI(TAG,
+                 "Reuse formulaOverall report msgId=%s for reason=%s",
+                 status.msg_id,
+                 reason ? reason : "unknown");
+        s_next_formula_overall_report_msg_id[0] = '\0';
+    }
+
     publish_device_status_to_mqtt_internal(&status, effective_section_mask);
 }
 

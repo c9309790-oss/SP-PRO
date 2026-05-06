@@ -8,6 +8,7 @@
 #include "nvs_flash.h"
 #include "esp_event.h"
 #include "esp_netif.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "mqtt_client.h"
@@ -21,6 +22,7 @@
 #include "wifi.h"
 #include "uart_ctr.h"
 #include "esp_crt_bundle.h"
+#include "nvs_retry.h"
 
 #define NVS_MQTT_CONFIG "mqtt_config"
 #define NVS_KEY_AUTH_GENERATED "auth_generated"
@@ -33,6 +35,50 @@
 #define MQTT_BOOTSTRAP_SENSORS_DELAY_MS 1000
 #define MQTT_BOOTSTRAP_FORMULA_DELAY_MS 1000
 #define MQTT_BOOTSTRAP_META_DELAY_MS 2000
+
+static const char *const s_mqtt_config_keys[] = {
+    "broker_uri",
+    "client_id",
+    "username",
+    "password",
+    "subscribe_topic",
+    "publish_topic",
+    "qos",
+    "keepalive",
+    "deviceType",
+};
+
+static esp_err_t mqtt_mark_auth_generated_write_to_nvs(nvs_handle_t nvs_handle, void *ctx)
+{
+    const bool *generated = (const bool *)ctx;
+
+    if (!generated) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return nvs_set_u8(nvs_handle, NVS_KEY_AUTH_GENERATED, *generated ? 1U : 0U);
+}
+
+static esp_err_t mqtt_params_write_to_nvs(nvs_handle_t nvs_handle, void *ctx)
+{
+    const mqtt_config_t *config = (const mqtt_config_t *)ctx;
+    esp_err_t err;
+
+    if (!config) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = nvs_set_str(nvs_handle, "broker_uri", config->broker_uri);
+    if (err == ESP_OK) err = nvs_set_str(nvs_handle, "client_id", config->client_id);
+    if (err == ESP_OK) err = nvs_set_str(nvs_handle, "username", config->username);
+    if (err == ESP_OK) err = nvs_set_str(nvs_handle, "password", config->password);
+    if (err == ESP_OK) err = nvs_set_str(nvs_handle, "subscribe_topic", config->subscribe_topic);
+    if (err == ESP_OK) err = nvs_set_str(nvs_handle, "publish_topic", config->publish_topic);
+    if (err == ESP_OK && config->qos[0] != 0) err = nvs_set_str(nvs_handle, "qos", config->qos);
+    if (err == ESP_OK && config->keepalive[0] != 0) err = nvs_set_str(nvs_handle, "keepalive", config->keepalive);
+    if (err == ESP_OK && config->deviceType[0] != 0) err = nvs_set_str(nvs_handle, "deviceType", config->deviceType);
+    return err;
+}
 #define MQTT_CLIENT_IN_BUFFER_SIZE 4096
 #define MQTT_CLIENT_OUT_BUFFER_SIZE 2048
 #define MQTT_CLIENT_NETWORK_TIMEOUT_MS 30000
@@ -51,7 +97,7 @@ static const char *TAG = "mqtt";
 
 mqtt_config_t mqtt_config;
 static esp_mqtt_client_handle_t client;
-static char mqtt_rx_buf[MQTT_RX_BUF_SIZE] = {0};
+static EXT_RAM_BSS_ATTR char mqtt_rx_buf[MQTT_RX_BUF_SIZE] = {0};
 static int mqtt_socka_on_cnt = 0;
 static mqtt_config_t mqtt_pending_switch_config;
 #if !MQTT_TEST_USE_POLL_SWITCH_CONFIG
@@ -66,8 +112,8 @@ static bool mqtt_persisted_ota_result_uploaded_this_connection = false;
 static uint32_t mqtt_bootstrap_round = 0;
 static bool mqtt_local_test_skip_logged = false;
 static bool mqtt_auth_wait_logged = false;
-static char mqtt_last_params_load_log_signature[512] = {0};
-static char mqtt_last_startup_summary_log_signature[192] = {0};
+static EXT_RAM_BSS_ATTR char mqtt_last_params_load_log_signature[512] = {0};
+static EXT_RAM_BSS_ATTR char mqtt_last_startup_summary_log_signature[192] = {0};
 typedef struct {
     bool pending;
     uint32_t section_mask;
@@ -100,6 +146,7 @@ static void mqtt_reset_immediate_status_report(void);
 static bool mqtt_process_immediate_status_report(void);
 static void mqtt_process_queued_status_reports(void);
 static void mqtt_upload_persisted_ota_result_once(const char *reason);
+static bool mqtt_try_publish_bootstrap_version_info(const char *reason);
 static void mqtt_build_topics_for_client_id(mqtt_config_t *config);
 static bool mqtt_resolve_preferred_client_id(char *client_id, size_t size, bool *from_factory_cfg, const char **source);
 static bool mqtt_apply_identity_policy(mqtt_config_t *config, bool clear_credentials_on_factory_override, bool *credentials_cleared);
@@ -137,14 +184,21 @@ static void mqtt_upload_persisted_ota_result_once(const char *reason)
 void mqtt_notify_power_on_reupload_needed(void)
 {
     mqtt_persisted_ota_result_uploaded_this_connection = false;
+    mqtt_bootstrap_publish_pending = true;
+    mqtt_bootstrap_publish_waiting_for_ctr_version = false;
     ESP_LOGI(TAG, "Mark persisted OTA result upload eligible again because device powered on from ST_OFF");
 
     if (client == NULL || sys_pra.mqtt_state != MQTT_CONNECTED || !mqtt_subscription_ready) {
         ESP_LOGI(TAG,
-                 "Skip immediate persisted OTA result upload after power on because MQTT is not ready (state=%d subscribed=%d)",
+                 "Skip immediate MQTT bootstrap after power on because MQTT is not ready (state=%d subscribed=%d)",
                  (int)sys_pra.mqtt_state,
                  mqtt_subscription_ready ? 1 : 0);
         return;
+    }
+
+    if (!mqtt_try_publish_bootstrap_version_info("power_on_from_st_off")) {
+        mqtt_bootstrap_publish_waiting_for_ctr_version = true;
+        ESP_LOGI(TAG, "Defer checklatestversionInfo after power on until CTR status/version is synced");
     }
 
     mqtt_upload_persisted_ota_result_once("power_on_from_st_off");
@@ -408,24 +462,58 @@ esp_err_t mqtt_mark_auth_generated(bool generated)
         err = nvs_commit(nvs_handle);
     }
 
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        static const char *const keys[] = {
+            NVS_KEY_AUTH_GENERATED,
+        };
+        err = nvs_retry_rewrite_after_erasing_keys(nvs_handle,
+                                                   err,
+                                                   TAG,
+                                                   "mqtt auth generated flag",
+                                                   keys,
+                                                   sizeof(keys) / sizeof(keys[0]),
+                                                   mqtt_mark_auth_generated_write_to_nvs,
+                                                   &generated);
+    }
+
     nvs_close(nvs_handle);
     return err;
 }
 
 static void mqtt_handle_ctr_version_update(const char *version)
 {
-    update_ctr_version(version);
-
     if (sys_pra.mqtt_state == MQTT_CONNECTED) {
-        if (mqtt_bootstrap_publish_waiting_for_ctr_version && mqtt_subscription_ready) {
-            mqtt_bootstrap_publish_waiting_for_ctr_version = false;
-            mqtt_bootstrap_publish_pending = false;
-            ESP_LOGI(TAG,
-                     "CTR version synced after MQTT subscribe, publish deferred checklatestversion now: %s",
-                     version ? version : "");
+        if (mqtt_try_publish_bootstrap_version_info("ctr_status_synced")) {
+            return;
         }
+
+        ESP_LOGI(TAG, "Publish checklatestversionInfo for CTR version update: %s", version ? version : "");
         publish_version_info_to_mqtt(&g_device_version);
     }
+}
+
+static bool mqtt_try_publish_bootstrap_version_info(const char *reason)
+{
+    if (!mqtt_bootstrap_publish_pending && !mqtt_bootstrap_publish_waiting_for_ctr_version) {
+        return false;
+    }
+
+    if (client == NULL || sys_pra.mqtt_state != MQTT_CONNECTED || !mqtt_subscription_ready) {
+        return false;
+    }
+
+    if (ctr_uart_get_last_status_tick() == 0U) {
+        return false;
+    }
+
+    mqtt_bootstrap_publish_pending = false;
+    mqtt_bootstrap_publish_waiting_for_ctr_version = false;
+    ESP_LOGI(TAG,
+             "Publish bootstrap checklatestversionInfo after %s, ctr_version=%s",
+             reason ? reason : "unknown",
+             g_device_version.current_ctr_fw_version);
+    publish_version_info_to_mqtt(&g_device_version);
+    return true;
 }
 
 static void mqtt_log_memory_snapshot(const char *phase)
@@ -1069,10 +1157,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         mqtt_subscription_ready = true;
         ESP_LOGI(TAG, "Subscribed, msg_id=%d, bootstrap_round_next=%lu", event->msg_id, (unsigned long)(mqtt_bootstrap_round + 1U));
         if (mqtt_bootstrap_publish_pending) {
-            if (ctr_uart_get_last_status_tick() > 0U) {
-                mqtt_bootstrap_publish_pending = false;
-                publish_version_info_to_mqtt(&g_device_version);
-            } else {
+            if (!mqtt_try_publish_bootstrap_version_info("mqtt_subscribed")) {
                 mqtt_bootstrap_publish_waiting_for_ctr_version = true;
                 ESP_LOGI(TAG,
                          "Defer initial checklatestversion publish until CTR status/version is synced");
@@ -1116,70 +1201,22 @@ static esp_err_t mqtt_params_save(const mqtt_config_t *config)
         return err;
     }
 
-    err = nvs_set_str(nvs_handle, "broker_uri", config->broker_uri);
-    if (err != ESP_OK) {
-        nvs_close(nvs_handle);
-        return err;
+    err = mqtt_params_write_to_nvs(nvs_handle, (void *)config);
+
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
     }
 
-    err = nvs_set_str(nvs_handle, "client_id", config->client_id);
-    if (err != ESP_OK) {
-        nvs_close(nvs_handle);
-        return err;
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        err = nvs_retry_rewrite_after_erasing_keys(nvs_handle,
+                                                   err,
+                                                   TAG,
+                                                   "mqtt config",
+                                                   s_mqtt_config_keys,
+                                                   sizeof(s_mqtt_config_keys) / sizeof(s_mqtt_config_keys[0]),
+                                                   mqtt_params_write_to_nvs,
+                                                   (void *)config);
     }
-
-    err = nvs_set_str(nvs_handle, "username", config->username);
-    if (err != ESP_OK) {
-        nvs_close(nvs_handle);
-        return err;
-    }
-
-    err = nvs_set_str(nvs_handle, "password", config->password);
-    if (err != ESP_OK) {
-        nvs_close(nvs_handle);
-        return err;
-    }
-
-    err = nvs_set_str(nvs_handle, "subscribe_topic", config->subscribe_topic);
-    if (err != ESP_OK) {
-        nvs_close(nvs_handle);
-        return err;
-    }
-
-    err = nvs_set_str(nvs_handle, "publish_topic", config->publish_topic);
-    if (err != ESP_OK) {
-        nvs_close(nvs_handle);
-        return err;
-    }
-
-    if (config->qos[0] != 0) {
-        err = nvs_set_str(nvs_handle, "qos", config->qos);
-    }
-
-    if (err != ESP_OK) {
-        nvs_close(nvs_handle);
-        return err;
-    }
-
-    if (config->keepalive[0] != 0) {
-        err = nvs_set_str(nvs_handle, "keepalive", config->keepalive);
-    }
-
-    if (err != ESP_OK) {
-        nvs_close(nvs_handle);
-        return err;
-    }
-
-    if (config->deviceType[0] != 0) {
-        err = nvs_set_str(nvs_handle, "deviceType", config->deviceType);
-    }
-
-    if (err != ESP_OK) {
-        nvs_close(nvs_handle);
-        return err;
-    }
-
-    err = nvs_commit(nvs_handle);
     nvs_close(nvs_handle);
     ESP_LOGI(TAG,
              "Write MQTT uri:%s, client_id:%s, username:%s, password:%s, subscribe_topic:%s, publish_topic:%s, qos:%s, keepalive:%s, deviceType:%s",

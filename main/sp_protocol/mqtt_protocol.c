@@ -7,6 +7,9 @@ static bool mqtt_handle_device_data_from_mqtt(const char *msg_id, cJSON *data)
     if (mqtt_handle_formula_ack_data_from_mqtt(data))
         return true;
 
+    if (mqtt_handle_extraction_curve_ack_data_from_mqtt(data))
+        return true;
+
     if (mqtt_handle_formula_setting_data_from_mqtt(msg_id, data))
         return true;
 

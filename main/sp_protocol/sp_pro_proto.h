@@ -52,7 +52,7 @@ enum {
 typedef enum {
     WHITE_LIGHT_OFF  = 0,  /* 00: 熄灭 */
     WHITE_LIGHT_HALF = 1,  /* 01: 半亮 */
-    WHITE_LIGHT_FULL = 3,  /* 11: 全亮 */
+    WHITE_LIGHT_FULL = 2,  /* 10: 全亮 */
 } white_light_level_t;
 
 typedef enum {

@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_audio_simple_dec.h"
 #include "esp_opus_dec.h"
@@ -59,7 +60,7 @@ static uint8_t *s_decode_buf = NULL;
 static size_t s_decode_buf_cap = DECODE_BUF_SIZE;
 static uint8_t s_ogg_hdr[27];
 static uint8_t s_seg_table[255];
-static uint8_t s_silence_buf[SILENCE_BUF_SIZE] = {0};
+static EXT_RAM_BSS_ATTR uint8_t s_silence_buf[SILENCE_BUF_SIZE] = {0};
 static uint8_t *s_audio_dma_buf = NULL;
 static size_t s_audio_dma_buf_cap = 2048;
 

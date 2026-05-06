@@ -88,7 +88,7 @@ static const disp_param_desc_t g_param_desc[] = {
         .mode         = ENCODER_MODE_HOT_WATER_TEMP,
         .kind         = DISP_KIND_TEMP,
         .pos          = BF_POS_LEFT,
-        .unit_mask    = BF_UNIT_S3 | BF_UNIT_S5,
+        .unit_mask    = BF_UNIT_S4 | BF_UNIT_S5,
         .clear_fn     = clear_temp_left,
     },
     {
@@ -444,11 +444,11 @@ void disp_set_s_indicator(disp_element_t *d, unit_indicator_t unit, bool on, boo
         d->icons.byte18.s2 = on;
         d->blink.byte25.s2_blink = blink;
         break;
-    case BF_UNIT_S3:  // degree symbol
+    case BF_UNIT_S3:  // coffee outlet icon
         d->icons.byte18.s3 = on;
         d->blink.byte25.s3_blink = blink;
         break;
-    case BF_UNIT_S4:  // cleaning icon
+    case BF_UNIT_S4:  // hot water outlet icon
         d->icons.byte19.s4 = on;
         d->blink.byte25.s4_blink = blink;
         break;
@@ -742,21 +742,30 @@ void disp_show_weight(disp_element_t *d, pos_indicator_t pos, float weight_g, fl
     disp_show_weight_with_unit(d, pos, weight_g, target_g, false);
 }
 
-void disp_show_flow_coeff(disp_element_t *d,
-                          pos_indicator_t pos,
-                          float coeff,
-                          int8_t adjust_percent)
+void disp_show_cup_calibration(disp_element_t *d,
+                               pos_indicator_t pos,
+                               float coeff,
+                               int8_t adjust_percent)
 {
     uint8_t percent;
     uint8_t gauge_max;
+    int display_value;
 
     if (!d) {
         return;
     }
 
-    /* The panel only has 3 large digits, so render coefficient * 100 with 1 decimal.
-     * Example: 0.45 -> 45.0, which still preserves 0.01-level adjustments visibly. */
-    disp_show_large_weight_value(d, pos, coeff * 100.0f);
+    (void)coeff;
+
+    /* Show the current adjustment around a neutral 100 baseline:
+     * 100 = no extra adjustment, 101 = +1%, 99 = -1%. */
+    display_value = 100 + (int)adjust_percent;
+    if (display_value < 0) {
+        display_value = 0;
+    } else if (display_value > 999) {
+        display_value = 999;
+    }
+    disp_show_large_weight_value(d, pos, (float)display_value);
 
     if (pos == BF_POS_LEFT) {
         disp_set_s_indicator(d, BF_UNIT_S1, false, false);
@@ -973,6 +982,10 @@ void disp_apply_key_mode(const app_display_view_t *view,
                     d,
                     i,
                     child_lock_enabled ? WHITE_LIGHT_FULL : WHITE_LIGHT_HALF);
+                disp_set_key_text(
+                    d,
+                    i,
+                    child_lock_enabled ? WHITE_LIGHT_FULL : WHITE_LIGHT_HALF);
             }
         }
 
@@ -1016,6 +1029,7 @@ void disp_apply_key_mode(const app_display_view_t *view,
 
     case KEY_MODE_CHILD_LOCK:
         disp_set_key_icon(d, BF_KEY_K8, WHITE_LIGHT_FULL);
+        disp_set_key_text(d, BF_KEY_K8, WHITE_LIGHT_FULL);
         break;
 
     case KEY_MODE_ALL_OFF:

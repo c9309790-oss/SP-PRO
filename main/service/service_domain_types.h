@@ -16,7 +16,7 @@ typedef enum {
 
 typedef struct
 {
-    uint8_t pressure;
+    float pressure;
     uint16_t wait_time;
 } pressure_stage_t;
 
@@ -46,11 +46,11 @@ typedef struct
     uint8_t drink_id;
     char drink_name[32];
 
-    uint8_t label_id;
+    int32_t label_id;
     char label[16];
 
     uint8_t grind_range;
-    uint16_t grind_weight;
+    float grind_weight;
 
     uint16_t preset_temperature;
     uint16_t preset_liquid_weight;
@@ -85,6 +85,25 @@ typedef struct
     material_item_t materials[10];
     uint16_t material_cnt;
 } drink_record_t;
+
+#define EXTRACTION_CURVE_MAX_POINTS 64
+
+typedef struct
+{
+    uint32_t elapsed_ms;
+    float pressure;
+    float flow_rate;
+} extraction_curve_point_t;
+
+typedef struct
+{
+    uint32_t id;
+    long produce_time;
+    bool curve_update;
+    formula_info_t semi_formula;
+    extraction_curve_point_t points[EXTRACTION_CURVE_MAX_POINTS];
+    uint16_t point_count;
+} extraction_curve_record_t;
 
 typedef struct
 {

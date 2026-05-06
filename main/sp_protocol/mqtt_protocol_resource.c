@@ -20,6 +20,102 @@ static uint16_t mqtt_resource_prebrew_water_volume_for_report(const formula_info
     return formula->prebrew.water_volume;
 }
 
+static cJSON *mqtt_create_formula_json(const formula_info_t *formula)
+{
+    cJSON *semi_formula;
+    cJSON *prebrew;
+    cJSON *pressure_stage_array;
+    cJSON *velocity_stage_array;
+
+    if (!formula) {
+        return NULL;
+    }
+
+    semi_formula = cJSON_CreateObject();
+    cJSON_AddNumberToObject(semi_formula, "recordId", formula->record_id);
+    cJSON_AddNumberToObject(semi_formula, "formulaId", formula->formula_id);
+    cJSON_AddStringToObject(semi_formula, "formulaName", formula->formula_name);
+    cJSON_AddStringToObject(semi_formula, "formulaRemark", formula->formula_remark);
+    cJSON_AddStringToObject(semi_formula, "supportMode", formula->support_mode);
+    cJSON_AddNumberToObject(semi_formula, "drinkId", formula->drink_id);
+    cJSON_AddStringToObject(semi_formula, "drinkName", formula->drink_name);
+    cJSON_AddNumberToObject(semi_formula, "labelId", formula->label_id);
+    cJSON_AddStringToObject(semi_formula, "label", formula->label);
+    cJSON_AddNumberToObject(semi_formula, "grindRange", formula->grind_range);
+    cJSON_AddNumberToObject(semi_formula, "grindWeight", formula->grind_weight);
+    cJSON_AddNumberToObject(semi_formula, "presetTemperature", formula->preset_temperature);
+    cJSON_AddNumberToObject(semi_formula, "presetLiquidWeight", formula->preset_liquid_weight);
+    cJSON_AddNumberToObject(semi_formula, "waterTemperature", formula->water_temperature);
+    cJSON_AddNumberToObject(semi_formula, "waterWeight", formula->water_weight);
+    cJSON_AddNumberToObject(semi_formula, "milkTemperature", formula->milk_temperature);
+    cJSON_AddNumberToObject(semi_formula, "stagePriority", formula->stage_priority);
+
+    prebrew = cJSON_CreateObject();
+    cJSON_AddNumberToObject(prebrew, "status", formula->prebrew.status);
+    cJSON_AddNumberToObject(prebrew, "flowVelocity", formula->prebrew.flow_velocity);
+    cJSON_AddNumberToObject(prebrew, "waitTime", formula->prebrew.wait_time);
+    cJSON_AddNumberToObject(prebrew,
+                            "waterVolume",
+                            mqtt_resource_prebrew_water_volume_for_report(formula));
+    cJSON_AddItemToObject(semi_formula, "preBrew", prebrew);
+
+    pressure_stage_array = cJSON_CreateArray();
+    for (int i = 0; i < formula->pressure_stage_cnt; i++)
+    {
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "pressure", formula->pressure_stage[i].pressure);
+        cJSON_AddNumberToObject(item, "waitTime", formula->pressure_stage[i].wait_time);
+        cJSON_AddItemToArray(pressure_stage_array, item);
+    }
+    cJSON_AddItemToObject(semi_formula, "pressureStage", pressure_stage_array);
+
+    velocity_stage_array = cJSON_CreateArray();
+    for (int i = 0; i < formula->velocity_stage_cnt; i++)
+    {
+        cJSON *item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "flowVelocity", formula->velocity_stage[i].flow_velocity);
+        cJSON_AddNumberToObject(item, "waitTime", formula->velocity_stage[i].wait_time);
+        cJSON_AddItemToArray(velocity_stage_array, item);
+    }
+    cJSON_AddItemToObject(semi_formula, "velocityStage", velocity_stage_array);
+
+    return semi_formula;
+}
+
+static char *mqtt_build_curve_profile_string(const extraction_curve_record_t *record, bool pressure_profile)
+{
+    size_t estimated_len;
+    size_t used = 0U;
+    char *buffer;
+
+    if (!record || record->point_count == 0U) {
+        return mqtt_strdup("");
+    }
+
+    estimated_len = ((size_t)record->point_count * 32U) + 1U;
+    buffer = calloc(estimated_len, sizeof(char));
+    if (!buffer) {
+        return NULL;
+    }
+
+    for (uint16_t i = 0U; i < record->point_count; i++) {
+        const extraction_curve_point_t *point = &record->points[i];
+        int written = snprintf(buffer + used,
+                               estimated_len - used,
+                               "%sx%.3fy%.2f",
+                               (i == 0U) ? "" : ",",
+                               (double)point->elapsed_ms / 1000.0,
+                               pressure_profile ? (double)point->pressure
+                                                : (double)point->flow_rate);
+        if (written < 0 || (size_t)written >= (estimated_len - used)) {
+            break;
+        }
+        used += (size_t)written;
+    }
+
+    return buffer;
+}
+
 void mqtt_register_resource_response_handler(mqtt_resource_response_handler_t handler)
 {
     s_resource_response_handler = handler;
@@ -258,55 +354,8 @@ void publish_drink_record_to_mqtt(drink_record_t *rec)
     cJSON_AddNumberToObject(drink_record, "result", rec->result);
     cJSON_AddNumberToObject(drink_record, "dataType", rec->data_type);
 
-    cJSON *semi_formula = cJSON_CreateObject();
     formula_info_t *formula = &rec->semi_formula;
-    cJSON_AddNumberToObject(semi_formula, "recordId", formula->record_id);
-    cJSON_AddNumberToObject(semi_formula, "formulaId", formula->formula_id);
-    cJSON_AddStringToObject(semi_formula, "formulaName", formula->formula_name);
-    cJSON_AddStringToObject(semi_formula, "formulaRemark", formula->formula_remark);
-    cJSON_AddStringToObject(semi_formula, "supportMode", formula->support_mode);
-    cJSON_AddNumberToObject(semi_formula, "drinkId", formula->drink_id);
-    cJSON_AddStringToObject(semi_formula, "drinkName", formula->drink_name);
-    cJSON_AddNumberToObject(semi_formula, "labelId", formula->label_id);
-    cJSON_AddStringToObject(semi_formula, "label", formula->label);
-    cJSON_AddNumberToObject(semi_formula, "grindRange", formula->grind_range);
-    cJSON_AddNumberToObject(semi_formula, "grindWeight", formula->grind_weight);
-    cJSON_AddNumberToObject(semi_formula, "presetTemperature", formula->preset_temperature);
-    cJSON_AddNumberToObject(semi_formula, "presetLiquidWeight", formula->preset_liquid_weight);
-    cJSON_AddNumberToObject(semi_formula, "waterTemperature", formula->water_temperature);
-    cJSON_AddNumberToObject(semi_formula, "waterWeight", formula->water_weight);
-    cJSON_AddNumberToObject(semi_formula, "milkTemperature", formula->milk_temperature);
-    cJSON_AddNumberToObject(semi_formula, "stagePriority", formula->stage_priority);
-
-    cJSON *prebrew = cJSON_CreateObject();
-    cJSON_AddNumberToObject(prebrew, "status", formula->prebrew.status);
-    cJSON_AddNumberToObject(prebrew, "flowVelocity", formula->prebrew.flow_velocity);
-    cJSON_AddNumberToObject(prebrew, "waitTime", formula->prebrew.wait_time);
-    cJSON_AddNumberToObject(prebrew,
-                            "waterVolume",
-                            mqtt_resource_prebrew_water_volume_for_report(formula));
-    cJSON_AddItemToObject(semi_formula, "preBrew", prebrew);
-
-    cJSON *pressure_stage_array = cJSON_CreateArray();
-    for (int i = 0; i < formula->pressure_stage_cnt; i++)
-    {
-        cJSON *item = cJSON_CreateObject();
-        cJSON_AddNumberToObject(item, "pressure", formula->pressure_stage[i].pressure);
-        cJSON_AddNumberToObject(item, "waitTime", formula->pressure_stage[i].wait_time);
-        cJSON_AddItemToArray(pressure_stage_array, item);
-    }
-    cJSON_AddItemToObject(semi_formula, "pressureStage", pressure_stage_array);
-
-    cJSON *velocity_stage_array = cJSON_CreateArray();
-    for (int i = 0; i < formula->velocity_stage_cnt; i++)
-    {
-        cJSON *item = cJSON_CreateObject();
-        cJSON_AddNumberToObject(item, "flowVelocity", formula->velocity_stage[i].flow_velocity);
-        cJSON_AddNumberToObject(item, "waitTime", formula->velocity_stage[i].wait_time);
-        cJSON_AddItemToArray(velocity_stage_array, item);
-    }
-    cJSON_AddItemToObject(semi_formula, "velocityStage", velocity_stage_array);
-    cJSON_AddItemToObject(drink_record, "semiFormula", semi_formula);
+    cJSON_AddItemToObject(drink_record, "semiFormula", mqtt_create_formula_json(formula));
 
     cJSON *materials_array = cJSON_CreateArray();
     for (int i = 0; i < rec->material_cnt; i++)
@@ -321,6 +370,60 @@ void publish_drink_record_to_mqtt(drink_record_t *rec)
 
     cJSON_AddItemToObject(data, "drinkRecord", drink_record);
     mqtt_publish_json_root(root);
+}
+
+void publish_extraction_curve_records_to_mqtt(extraction_curve_record_t *records,
+                                              int record_count,
+                                              bool curve_update)
+{
+#if !EXTRACTION_CURVE_FEATURE_ENABLE
+    (void)records;
+    (void)record_count;
+    (void)curve_update;
+    return;
+#else
+    cJSON *data = NULL;
+    cJSON *root;
+    cJSON *curve_info_array;
+    char sub_topic[160];
+
+    if (!records || record_count <= 0) {
+        return;
+    }
+
+    root = mqtt_create_message_root("0", NULL, &data);
+    mqtt_build_client_topic(sub_topic, sizeof(sub_topic), "dataserver/kalerm/iot/extractionCurve/%s");
+    mqtt_add_sub_topic(data, sub_topic);
+    cJSON_AddStringToObject(data, "curveUpdate", curve_update ? "true" : "false");
+
+    curve_info_array = cJSON_CreateArray();
+    for (int i = 0; i < record_count; i++) {
+        cJSON *curve_info;
+        cJSON *curve;
+        char *pressure_profile;
+        char *flow_profile;
+
+        pressure_profile = mqtt_build_curve_profile_string(&records[i], true);
+        flow_profile = mqtt_build_curve_profile_string(&records[i], false);
+
+        curve_info = cJSON_CreateObject();
+        curve = cJSON_CreateObject();
+        cJSON_AddNumberToObject(curve, "id", records[i].id);
+        cJSON_AddStringToObject(curve, "formulaName", records[i].semi_formula.formula_name);
+        cJSON_AddNumberToObject(curve, "time", records[i].produce_time);
+        cJSON_AddStringToObject(curve, "pressureProfile", pressure_profile ? pressure_profile : "");
+        cJSON_AddStringToObject(curve, "flowProfile", flow_profile ? flow_profile : "");
+        cJSON_AddItemToObject(curve_info, "curve", curve);
+        cJSON_AddItemToObject(curve_info, "semiFormula", mqtt_create_formula_json(&records[i].semi_formula));
+        cJSON_AddItemToArray(curve_info_array, curve_info);
+
+        free(pressure_profile);
+        free(flow_profile);
+    }
+
+    cJSON_AddItemToObject(data, "extractionCurveInfo", curve_info_array);
+    mqtt_publish_json_root(root);
+#endif
 }
 
 void publish_event_record_to_mqtt(event_record_t *rec)

@@ -1,6 +1,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "nvs_flash.h"
@@ -22,8 +23,10 @@
 #include "uart_ctr.h"
 #include "uart_hmi.h"
 #include "wifi.h"
+#include "controller_status_types.h"
 
 static const char *TAG = "main";
+extern FLASH_FACTORY_DATA factory_data;
 
 static void *cjson_psram_malloc(size_t size)
 {
@@ -66,10 +69,10 @@ const int klm_ETSI_EN_303645_ciphersuites_list[] = {
 };
 
 /* Shared RX buffer used by bridge handlers for UART/BLE text packets. */
-char rec_pack[MAX_OF_FOUR(KLM_UART_BUF_SIZE,
-                          KLM_MQTT_RX_BUF_SIZE,
-                          KLM_BLE_RX_BUF_SIZE,
-                          KLM_TCP_RX_BUF_SIZE) + KLM_MSG_HEAD_LEN_MAX];
+EXT_RAM_BSS_ATTR char rec_pack[MAX_OF_FOUR(KLM_UART_BUF_SIZE,
+                                           KLM_MQTT_RX_BUF_SIZE,
+                                           KLM_BLE_RX_BUF_SIZE,
+                                           KLM_TCP_RX_BUF_SIZE) + KLM_MSG_HEAD_LEN_MAX];
 
 /* HMI UART queue carrying raw text commands. */
 extern QueueHandle_t uart_rx_queue[1];
@@ -217,6 +220,30 @@ void bsp_init(void)
     ram_diag_snapshot("boot/bsp_init_done");
 }
 
+static void sync_factory_cfg_mains_frequency_to_factory_data(void)
+{
+    int mains_frequency = 0;
+
+    if (!factory_cfg_get_mains_frequency(&mains_frequency)) {
+        ESP_LOGW(TAG, "factory_cfg mains frequency not available, keep FLASH_FACTORY_DATA=%d", factory_data.mains_frequency);
+        return;
+    }
+
+    if (factory_data.mains_frequency == mains_frequency) {
+        ESP_LOGI(TAG,
+                 "FLASH_FACTORY_DATA mains profile already synced: %d",
+                 mains_frequency);
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "Apply factory_cfg mains profile to FLASH_FACTORY_DATA: %d -> %d",
+             factory_data.mains_frequency,
+             mains_frequency);
+    factory_data.mains_frequency = mains_frequency;
+    ctr_factory_data_persist();
+}
+
 void app_main(void)
 {
     char hmi_version_from_app[16] = {0};
@@ -234,6 +261,7 @@ void app_main(void)
     mqtt_get_hmi_version_from_app(hmi_version_from_app, sizeof(hmi_version_from_app));
     ESP_LOGI(TAG, "HMI version from app image: %s", hmi_version_from_app);
     ctr_uart_init(115200, PIN_CTR_RS485_RX, PIN_CTR_RS485_TX);
+    sync_factory_cfg_mains_frequency_to_factory_data();
     hmi_uart_init(UART_HMI_BAUDRATE, PIN_SCREEN_TTL_RX, PIN_SCREEN_TTL_TX);
     ram_diag_snapshot("boot/after_uart_init");
 

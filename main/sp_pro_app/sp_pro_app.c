@@ -10,6 +10,7 @@
 #include "led_service.h"
 #include "device_statistics_store.h"
 #include "drink_record_service.h"
+#include "extraction_curve_service.h"
 #include "ble.h"
 #include "mqtt.h"
 #include "mqtt_protocol.h"
@@ -19,10 +20,13 @@
 #include "formula_store.h"
 #include "nvs.h"
 #include "esp_err.h"
+#include "nvs_retry.h"
+#include "sp_pro_build_flags.h"
 #include <stddef.h>
 
 static const char *TAG = "sp_pro_app";
-#define APP_TEST_DISABLE_LOCAL_ALARM 1
+extern FLASH_FACTORY_DATA factory_data;
+extern MACHINE_STATUS machine_status;
 #define SP_PRO_LOGIC_TASK_STACK_SIZE_DEFAULT 12288
 #define SP_PRO_LOGIC_TASK_STACK_SIZE_TEST    8192
 #define SP_PRO_LOGIC_TASK_STACK_SIZE         SP_PRO_LOGIC_TASK_STACK_SIZE_TEST
@@ -30,32 +34,45 @@ static const char *TAG = "sp_pro_app";
 #define POWER_KEY_ACTIVE_LEVEL     0
 #define POWER_KEY_DEBOUNCE_TICKS   STAY_TICKS(50)
 #define POWER_KEY_LONG_PRESS_TICKS STAY_TICKS(2000)
+#define CLEAR_BEAN_LOADING_TICKS_VIEW STAY_TICKS(10000)
 
 /* Initial bench values for local liquid compensation.
  * TODO: move these into a dedicated calibration/settings entry once test-side
  * tuning is ready. */
 /* Default to zero compensation until each drink is bench-calibrated.
  * Non-zero placeholders distort the user-facing display immediately. */
+#define LIQ_COMP_ESPRESSO_DISPLAY_SCALE        0.938f
 #define LIQ_COMP_ESPRESSO_DISPLAY_OFFSET_ML    0.0f
-#define LIQ_COMP_ESPRESSO_STOP_AHEAD_ML        0.0f
+#define LIQ_COMP_ESPRESSO_STOP_AHEAD_ML       -3.0f
+#define LIQ_COMP_AME_BREW_DISPLAY_SCALE        0.771f
 #define LIQ_COMP_AME_BREW_DISPLAY_OFFSET_ML    0.0f
-#define LIQ_COMP_AME_BREW_STOP_AHEAD_ML        0.0f
+#define LIQ_COMP_AME_BREW_STOP_AHEAD_ML      -11.0f
+#define LIQ_COMP_COLD_BREW_DISPLAY_SCALE       0.825f
 #define LIQ_COMP_COLD_BREW_DISPLAY_OFFSET_ML   0.0f
-#define LIQ_COMP_COLD_BREW_STOP_AHEAD_ML       0.0f
+#define LIQ_COMP_COLD_BREW_STOP_AHEAD_ML      -17.0f
+#define LIQ_COMP_AME_WATER_DISPLAY_SCALE       0.833f
 #define LIQ_COMP_AME_WATER_DISPLAY_OFFSET_ML   0.0f
-#define LIQ_COMP_AME_WATER_STOP_AHEAD_ML       0.0f
+#define LIQ_COMP_AME_WATER_STOP_AHEAD_ML      -9.0f
+#define LIQ_COMP_HOT_WATER_DISPLAY_SCALE       0.875f
 #define LIQ_COMP_HOT_WATER_DISPLAY_OFFSET_ML   0.0f
-#define LIQ_COMP_HOT_WATER_STOP_AHEAD_ML       0.0f
+#define LIQ_COMP_HOT_WATER_STOP_AHEAD_ML      -10.0f
+#define CLEAN_VOLUME_MIN_ML                    15.0f
+#define CLEAN_VOLUME_MAX_ML                    100.0f
 
 static int s_last_auto_power_off_time = -1;
 static int s_last_auto_stand_by_time = -1;
 static uint32_t s_last_encoder_activity_seq = 0U;
 static uint8_t s_display_clear_reinforce_frames = 0U;
+static int s_last_task_status = 0;
+static volatile bool s_remote_power_on_request = false;
+static volatile bool s_remote_power_off_request = false;
 
 #define SP_PRO_SETTINGS_NVS_NAMESPACE "sp_pro_app"
 #define SP_PRO_SETTINGS_NVS_KEY       "settings_v1"
 #define SP_PRO_SETTINGS_MAGIC         0x53505031UL
-#define SP_PRO_SETTINGS_VERSION       1U
+#define SP_PRO_SETTINGS_VERSION       3U
+#define SP_PRO_DISPLAY_SCALE_DELTA_MIN 0.5f
+#define SP_PRO_DISPLAY_SCALE_DELTA_MAX 1.5f
 
 typedef struct {
     uint32_t magic;
@@ -73,6 +90,12 @@ typedef struct {
     float grind_w;
     float clean_v;
     float steam_level;
+    float hot_drink_display_scale_delta;
+    float hot_drink_display_offset_delta;
+    float hot_drink_stop_ahead_delta;
+    float hot_water_display_scale_delta;
+    float hot_water_display_offset_delta;
+    float hot_water_stop_ahead_delta;
     uint8_t water_in_mode;
     uint8_t hardness;
     uint8_t maint_resume_flag;
@@ -125,6 +148,7 @@ static void sp_pro_arm_standby_poweroff_deadline(void);
 static void sp_pro_sync_idle_timeout_config(void);
 static void sp_pro_capture_local_activity(void);
 static app_state_t sp_pro_apply_power_timeout(app_state_t cur);
+static app_state_t sp_pro_apply_remote_power_request(app_state_t cur);
 static void sp_pro_prepare_power_on_entry(void);
 static void sp_pro_power_key_init(void);
 static void sp_pro_power_key_tick(void);
@@ -148,26 +172,138 @@ static uint8_t s_last_beanbox_in_place = 0;
 static uint8_t s_last_water_box_shortage_flag = 0;
 static uint32_t s_last_error_code = 0;
 
+static bool sp_pro_report_task_status_change_if_needed(bool immediate, const char *reason)
+{
+    int task_status = mqtt_get_task_status();
+
+    if (task_status == s_last_task_status) {
+        return false;
+    }
+
+    ESP_LOGI(TAG,
+             "taskStatus changed %d -> %d reason=%s state=%d sub=%d ctr_status=%u drink=%u hotWater=%u grind=%u steam=%u",
+             s_last_task_status,
+             task_status,
+             reason ? reason : "unknown",
+             (int)g_ctx.core.state,
+             (int)g_ctx.core.substate,
+             (unsigned)machine_status.ctr_status,
+             (unsigned)machine_status.drink_making_flg,
+             (unsigned)machine_status.hot_water_flg,
+             (unsigned)machine_status.grind_run_flg,
+             (unsigned)machine_status.steam_flag);
+
+    s_last_task_status = task_status;
+
+    if (immediate) {
+        return mqtt_request_immediate_device_status_sections_report(
+            MQTT_DEVICE_STATUS_SECTION_SENSORS,
+            reason ? reason : "task_status_changed");
+    }
+
+    return mqtt_schedule_device_status_sections_report(
+        MQTT_DEVICE_STATUS_SECTION_SENSORS,
+        reason ? reason : "task_status_changed",
+        0U);
+}
+
 static const drink_liquid_compensation_t s_espresso_liquid_comp = {
+    LIQ_COMP_ESPRESSO_DISPLAY_SCALE,
     LIQ_COMP_ESPRESSO_DISPLAY_OFFSET_ML,
     LIQ_COMP_ESPRESSO_STOP_AHEAD_ML,
 };
 static const drink_liquid_compensation_t s_americano_brew_liquid_comp = {
+    LIQ_COMP_AME_BREW_DISPLAY_SCALE,
     LIQ_COMP_AME_BREW_DISPLAY_OFFSET_ML,
     LIQ_COMP_AME_BREW_STOP_AHEAD_ML,
 };
 static const drink_liquid_compensation_t s_cold_brew_liquid_comp = {
+    LIQ_COMP_COLD_BREW_DISPLAY_SCALE,
     LIQ_COMP_COLD_BREW_DISPLAY_OFFSET_ML,
     LIQ_COMP_COLD_BREW_STOP_AHEAD_ML,
 };
 static const drink_liquid_compensation_t s_americano_water_liquid_comp = {
+    LIQ_COMP_AME_WATER_DISPLAY_SCALE,
     LIQ_COMP_AME_WATER_DISPLAY_OFFSET_ML,
     LIQ_COMP_AME_WATER_STOP_AHEAD_ML,
 };
 static const drink_liquid_compensation_t s_hot_water_liquid_comp = {
+    LIQ_COMP_HOT_WATER_DISPLAY_SCALE,
     LIQ_COMP_HOT_WATER_DISPLAY_OFFSET_ML,
     LIQ_COMP_HOT_WATER_STOP_AHEAD_ML,
 };
+
+static float sp_pro_clamp_clean_volume(float clean_v)
+{
+    if (clean_v < CLEAN_VOLUME_MIN_ML) {
+        return CLEAN_VOLUME_MIN_ML;
+    }
+    if (clean_v > CLEAN_VOLUME_MAX_ML) {
+        return CLEAN_VOLUME_MAX_ML;
+    }
+    return clean_v;
+}
+
+static float sp_pro_normalize_display_scale_delta(float scale)
+{
+    if (scale < SP_PRO_DISPLAY_SCALE_DELTA_MIN ||
+        scale > SP_PRO_DISPLAY_SCALE_DELTA_MAX) {
+        return 1.0f;
+    }
+
+    return scale;
+}
+
+static esp_err_t sp_pro_settings_rewrite_to_nvs(nvs_handle_t nvs_handle, void *ctx)
+{
+    const sp_pro_persisted_settings_t *persisted = (const sp_pro_persisted_settings_t *)ctx;
+
+    if (!persisted) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return nvs_set_blob(nvs_handle, SP_PRO_SETTINGS_NVS_KEY, persisted, sizeof(*persisted));
+}
+
+static drink_liquid_compensation_t sp_pro_get_hot_drink_delta_comp(const app_ctx_t *ctx)
+{
+    if (!ctx) {
+        return (drink_liquid_compensation_t){1.0f, 0.0f, 0.0f};
+    }
+
+    return (drink_liquid_compensation_t){
+        sp_pro_normalize_display_scale_delta(ctx->setting.hot_drink_display_scale_delta),
+        0.0f,
+        ctx->setting.hot_drink_stop_ahead_delta,
+    };
+}
+
+static drink_liquid_compensation_t sp_pro_get_hot_water_delta_comp(const app_ctx_t *ctx)
+{
+    if (!ctx) {
+        return (drink_liquid_compensation_t){1.0f, 0.0f, 0.0f};
+    }
+
+    return (drink_liquid_compensation_t){
+        sp_pro_normalize_display_scale_delta(ctx->setting.hot_water_display_scale_delta),
+        0.0f,
+        ctx->setting.hot_water_stop_ahead_delta,
+    };
+}
+
+static drink_liquid_compensation_t sp_pro_merge_liquid_compensation(drink_liquid_compensation_t base,
+                                                                    drink_liquid_compensation_t delta)
+{
+    drink_liquid_compensation_t merged = base;
+
+    if (delta.display_scale > 0.0f) {
+        merged.display_scale *= delta.display_scale;
+    }
+
+    merged.display_offset_ml += delta.display_offset_ml;
+    merged.stop_ahead_ml += delta.stop_ahead_ml;
+    return merged;
+}
 
 static void sp_pro_check_device_sensor_changed(const MACHINE_STATUS *status)
 {
@@ -182,6 +318,16 @@ static void sp_pro_check_device_sensor_changed(const MACHINE_STATUS *status)
         s_last_water_box_shortage_flag = status->water_box_shortage_flag;
         s_last_error_code = status->error_code;
         s_device_sensor_snapshot_valid = true;
+        ESP_LOGI(TAG,
+                 "Sensor snapshot initialized shortage=%u localWaterMode=%u "
+                 "factoryWaterMode=%d ctr_status=%u error=%u hotWater=%u drink=%u",
+                 (unsigned)status->water_box_shortage_flag,
+                 (unsigned)g_ctx.setting.water_in_mode,
+                 factory_data.water_supply_mode,
+                 (unsigned)status->ctr_status,
+                 (unsigned)status->error_code,
+                 (unsigned)status->hot_water_flg,
+                 (unsigned)status->drink_making_flg);
         return;
     }
 
@@ -200,10 +346,26 @@ static void sp_pro_check_device_sensor_changed(const MACHINE_STATUS *status)
     if (s_last_beanbox_in_place != status->beanbox_in_place) {
         changed = true;
         s_last_beanbox_in_place = status->beanbox_in_place;
+        if (status->beanbox_in_place == 1U &&
+            g_ctx.state_runtime.clear_bean.post_clean_notice_pending) {
+            g_ctx.state_runtime.clear_bean.post_clean_notice_pending = false;
+            ESP_LOGI(TAG, "Clear-bean post notice cleared by hopper relock");
+        }
     }
 
     if (s_last_water_box_shortage_flag != status->water_box_shortage_flag) {
         changed = true;
+        ESP_LOGW(TAG,
+                 "Water shortage flag changed %u -> %u | localWaterMode=%u "
+                 "factoryWaterMode=%d ctr_status=%u error=%u hotWater=%u drink=%u",
+                 (unsigned)s_last_water_box_shortage_flag,
+                 (unsigned)status->water_box_shortage_flag,
+                 (unsigned)g_ctx.setting.water_in_mode,
+                 factory_data.water_supply_mode,
+                 (unsigned)status->ctr_status,
+                 (unsigned)status->error_code,
+                 (unsigned)status->hot_water_flg,
+                 (unsigned)status->drink_making_flg);
         s_last_water_box_shortage_flag = status->water_box_shortage_flag;
     }
 
@@ -212,14 +374,22 @@ static void sp_pro_check_device_sensor_changed(const MACHINE_STATUS *status)
         s_last_error_code = status->error_code;
     }
 
+    if (sp_pro_report_task_status_change_if_needed(true, "task_status_changed")) {
+        return;
+    }
+
     if (changed) {
-        mqtt_report_device_status_sections(MQTT_DEVICE_STATUS_SECTION_SENSORS,
-                                           "device_sensor_changed");
+        (void)mqtt_request_immediate_device_status_sections_report(
+            MQTT_DEVICE_STATUS_SECTION_SENSORS,
+            "device_sensor_changed");
     }
 }
 
 drink_liquid_compensation_t sp_pro_get_active_liquid_compensation(const app_ctx_t *ctx)
 {
+    drink_liquid_compensation_t base;
+    drink_liquid_compensation_t delta;
+
     if (!ctx) {
         return (drink_liquid_compensation_t){0};
     }
@@ -227,21 +397,31 @@ drink_liquid_compensation_t sp_pro_get_active_liquid_compensation(const app_ctx_
     switch (ctx->core.state) {
     case ST_ESPRESSO:
     case ST_MASTER:
-        return s_espresso_liquid_comp;
+        base = s_espresso_liquid_comp;
+        delta = sp_pro_get_hot_drink_delta_comp(ctx);
+        return sp_pro_merge_liquid_compensation(base, delta);
 
     case ST_AMERICANO:
         if (ctx->core.substate == BREW_SUB_RUNNING_2 ||
             ctx->core.substate == BREW_SUB_FINISH ||
             ctx->drink.target_ml == (uint16_t)(ctx->setting.ame_water_w + 0.5f)) {
-            return s_americano_water_liquid_comp;
+            base = s_americano_water_liquid_comp;
+            delta = sp_pro_get_hot_water_delta_comp(ctx);
+            return sp_pro_merge_liquid_compensation(base, delta);
         }
-        return s_americano_brew_liquid_comp;
+        base = s_americano_brew_liquid_comp;
+        delta = sp_pro_get_hot_drink_delta_comp(ctx);
+        return sp_pro_merge_liquid_compensation(base, delta);
 
     case ST_COLD_BREW:
-        return s_cold_brew_liquid_comp;
+        base = s_cold_brew_liquid_comp;
+        delta = sp_pro_get_hot_drink_delta_comp(ctx);
+        return sp_pro_merge_liquid_compensation(base, delta);
 
     case ST_WATER:
-        return s_hot_water_liquid_comp;
+        base = s_hot_water_liquid_comp;
+        delta = sp_pro_get_hot_water_delta_comp(ctx);
+        return sp_pro_merge_liquid_compensation(base, delta);
 
     default:
         return (drink_liquid_compensation_t){0};
@@ -263,28 +443,90 @@ float sp_pro_get_raw_liquid_progress_ml(const app_ctx_t *ctx)
     return raw_progress;
 }
 
+float sp_pro_apply_liquid_display_compensation(float raw_progress_ml,
+                                               drink_liquid_compensation_t comp)
+{
+    float display_ml = raw_progress_ml;
+
+    if (display_ml < 0.0f) {
+        display_ml = 0.0f;
+    }
+
+    if (comp.display_scale > 0.0f) {
+        display_ml *= comp.display_scale;
+    }
+
+    display_ml -= comp.display_offset_ml;
+    if (display_ml < 0.0f) {
+        display_ml = 0.0f;
+    }
+
+    return display_ml;
+}
+
 float sp_pro_get_display_liquid_ml(const app_ctx_t *ctx)
 {
+    static const uint32_t TARGET_DISPLAY_CAP_HOLD_TICKS = STAY_TICKS_1S;
+    app_ctx_t *mutable_ctx = (app_ctx_t *)ctx;
     drink_liquid_compensation_t comp;
     float display_ml;
+    float max_display_ml;
+    float prefinish_cap_ml;
+    bool uses_precompensated_display;
 
     if (!ctx) {
         return 0.0f;
     }
 
+    uses_precompensated_display = (ctx->core.state == ST_WATER) ||
+                                  (ctx->core.state == ST_AMERICANO &&
+                                   (ctx->core.substate == BREW_SUB_RUNNING_2 ||
+                                    ctx->core.substate == BREW_SUB_FINISH));
+
     if (ctx->core.state == ST_WATER ||
         (ctx->core.state == ST_AMERICANO &&
          (ctx->core.substate == BREW_SUB_RUNNING_2 ||
-          ctx->core.substate == BREW_SUB_FINISH))) {
+           ctx->core.substate == BREW_SUB_FINISH))) {
         display_ml = ctx->state_runtime.drink.display_liquid_ml;
     } else {
         display_ml = sp_pro_get_raw_liquid_progress_ml(ctx);
     }
 
-    comp = sp_pro_get_active_liquid_compensation(ctx);
-    display_ml -= comp.display_offset_ml;
-    if (display_ml < 0.0f) {
-        display_ml = 0.0f;
+    if (!uses_precompensated_display) {
+        comp = sp_pro_get_active_liquid_compensation(ctx);
+        display_ml = sp_pro_apply_liquid_display_compensation(display_ml, comp);
+    }
+
+    if (!(ctx->ctrl.src == CTRL_SRC_MQTT && ctx->ctrl.formula != NULL) &&
+        ctx->drink.target_ml > 0U) {
+        if (ctx->state_runtime.drink.force_target_display_active) {
+            mutable_ctx->state_runtime.drink.target_display_cap_tick = 0U;
+            max_display_ml = ctx->state_runtime.drink.force_target_display_ml;
+        } else if (ctx->drink.target_ml > 3U) {
+            prefinish_cap_ml = (float)(ctx->drink.target_ml - 3U);
+            if (display_ml >= prefinish_cap_ml) {
+                if (ctx->state_runtime.drink.target_display_cap_tick == 0U) {
+                    mutable_ctx->state_runtime.drink.target_display_cap_tick = ctx->timer.tick;
+                }
+
+                if ((ctx->timer.tick - ctx->state_runtime.drink.target_display_cap_tick) >=
+                    TARGET_DISPLAY_CAP_HOLD_TICKS) {
+                    max_display_ml = (float)ctx->drink.target_ml;
+                } else {
+                    max_display_ml = prefinish_cap_ml;
+                }
+            } else {
+                mutable_ctx->state_runtime.drink.target_display_cap_tick = 0U;
+                max_display_ml = prefinish_cap_ml;
+            }
+        } else {
+            mutable_ctx->state_runtime.drink.target_display_cap_tick = 0U;
+            max_display_ml = (float)ctx->drink.target_ml;
+        }
+
+        if (display_ml > max_display_ml) {
+            display_ml = max_display_ml;
+        }
     }
 
     return display_ml;
@@ -702,8 +944,10 @@ static void sp_pro_apply_state_side_effects(app_state_t cur, app_state_t next)
 
         device_statistics_notify_local_state_start(next);
         drink_record_notify_local_state_start(next, &beverage_settings);
+        extraction_curve_notify_local_state_start(next, &beverage_settings);
     }
 
+    (void)sp_pro_report_task_status_change_if_needed(false, "task_status_state_change");
     sp_pro_sync_led_effect();
 }
 
@@ -812,6 +1056,9 @@ static void sp_pro_reset_clear_bean_runtime(app_ctx_t *ctx)
     ctx->clear_bean.step_tick = 0U;
     ctx->state_runtime.clear_bean.entered = false;
     ctx->state_runtime.clear_bean.grinder_started = false;
+    ctx->state_runtime.clear_bean.done_voice_stage = 0U;
+    ctx->state_runtime.clear_bean.done_grace_tick = 0U;
+    ctx->state_runtime.ready.clear_bean_unlock_tick = 0U;
 }
 
 static void sp_pro_prepare_setting_leave(app_ctx_t *ctx, app_state_t cur)
@@ -944,8 +1191,9 @@ static app_state_t sp_pro_apply_power_key(app_state_t cur)
             return ST_OFF;
         }
         if (short_event) {
-            ESP_LOGI(TAG, "Power key short press -> ST_READY");
-            return ST_READY;
+            app_state_t wake_state = g_ctx.child_lock.enabled ? ST_LOCK : ST_READY;
+            ESP_LOGI(TAG, "Power key short press -> %s", wake_state == ST_LOCK ? "ST_LOCK" : "ST_READY");
+            return wake_state;
         }
         break;
 
@@ -957,6 +1205,18 @@ static app_state_t sp_pro_apply_power_key(app_state_t cur)
         }
         if (short_event) {
             ESP_LOGI(TAG, "Power key short press -> ST_STANDBY");
+            return ST_STANDBY;
+        }
+        break;
+
+    case ST_LOCK:
+        if (long_event) {
+            ESP_LOGI(TAG, "Power key long press from ST_LOCK -> ST_OFF");
+            voice_manager_play_touch_tone();
+            return ST_OFF;
+        }
+        if (short_event) {
+            ESP_LOGI(TAG, "Power key short press from ST_LOCK -> ST_STANDBY");
             return ST_STANDBY;
         }
         break;
@@ -1046,8 +1306,8 @@ static void sp_pro_sync_beverage_settings_from_formula_store(app_ctx_t *ctx)
     if (espresso) {
         ctx->setting.esp_brew_w = (float)espresso->preset_liquid_weight;
         ctx->setting.esp_brew_t = (float)espresso->preset_temperature;
-        if (espresso->grind_weight > 0U) {
-            ctx->setting.grind_w = (float)espresso->grind_weight;
+        if (espresso->grind_weight > 0.0f) {
+            ctx->setting.grind_w = espresso->grind_weight;
         }
     }
 
@@ -1056,8 +1316,8 @@ static void sp_pro_sync_beverage_settings_from_formula_store(app_ctx_t *ctx)
         ctx->setting.ame_brew_t = (float)americano->preset_temperature;
         ctx->setting.ame_water_w = (float)americano->water_weight;
         ctx->setting.ame_water_t = (float)americano->water_temperature;
-        if (!espresso && americano->grind_weight > 0U) {
-            ctx->setting.grind_w = (float)americano->grind_weight;
+        if (!espresso && americano->grind_weight > 0.0f) {
+            ctx->setting.grind_w = americano->grind_weight;
         }
     }
 
@@ -1065,8 +1325,8 @@ static void sp_pro_sync_beverage_settings_from_formula_store(app_ctx_t *ctx)
         ctx->setting.cold_brew_w = (float)((cold_brew->preset_liquid_weight > 0U)
                                                ? cold_brew->preset_liquid_weight
                                                : cold_brew->water_weight);
-        if (!espresso && !americano && cold_brew->grind_weight > 0U) {
-            ctx->setting.grind_w = (float)cold_brew->grind_weight;
+        if (!espresso && !americano && cold_brew->grind_weight > 0.0f) {
+            ctx->setting.grind_w = cold_brew->grind_weight;
         }
     }
 
@@ -1109,6 +1369,20 @@ bool sp_pro_app_save_settings(void)
     if (err == ESP_OK) {
         err = nvs_commit(nvs_handle);
     }
+
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        static const char *const keys[] = {
+            SP_PRO_SETTINGS_NVS_KEY,
+        };
+        err = nvs_retry_rewrite_after_erasing_keys(nvs_handle,
+                                                   err,
+                                                   TAG,
+                                                   "settings",
+                                                   keys,
+                                                   sizeof(keys) / sizeof(keys[0]),
+                                                   sp_pro_settings_rewrite_to_nvs,
+                                                   &persisted);
+    }
     nvs_close(nvs_handle);
 
     if (err != ESP_OK) {
@@ -1122,7 +1396,7 @@ bool sp_pro_app_save_settings(void)
 
 void sp_pro_app_set_clean_volume(float clean_v)
 {
-    g_ctx.setting.clean_v = clean_v;
+    g_ctx.setting.clean_v = sp_pro_clamp_clean_volume(clean_v);
 }
 
 float sp_pro_app_get_clean_volume(void)
@@ -1154,6 +1428,12 @@ static void sp_pro_apply_default_settings(app_ctx_t *ctx)
     ctx->setting.grind_w = 0.0f;
     ctx->setting.clean_v = 30.0f;
     ctx->setting.steam_level = 2.0f;
+    ctx->setting.hot_drink_display_scale_delta = 1.0f;
+    ctx->setting.hot_drink_display_offset_delta = 0.0f;
+    ctx->setting.hot_drink_stop_ahead_delta = 0.0f;
+    ctx->setting.hot_water_display_scale_delta = 1.0f;
+    ctx->setting.hot_water_display_offset_delta = 0.0f;
+    ctx->setting.hot_water_stop_ahead_delta = 0.0f;
     ctx->setting.water_in_mode = WATER_IN_MODE_BUCKET;
     ctx->setting.hardness = HARDNESS_LEVEL_B;
     ctx->child_lock.enabled = 0;
@@ -1170,6 +1450,12 @@ static void sp_pro_export_persisted_settings(const app_ctx_t *ctx, sp_pro_persis
     persisted->version = SP_PRO_SETTINGS_VERSION;
     persisted->clean_v = ctx->setting.clean_v;
     persisted->steam_level = ctx->setting.steam_level;
+    persisted->hot_drink_display_scale_delta = ctx->setting.hot_drink_display_scale_delta;
+    persisted->hot_drink_display_offset_delta = ctx->setting.hot_drink_display_offset_delta;
+    persisted->hot_drink_stop_ahead_delta = ctx->setting.hot_drink_stop_ahead_delta;
+    persisted->hot_water_display_scale_delta = ctx->setting.hot_water_display_scale_delta;
+    persisted->hot_water_display_offset_delta = ctx->setting.hot_water_display_offset_delta;
+    persisted->hot_water_stop_ahead_delta = ctx->setting.hot_water_stop_ahead_delta;
     persisted->water_in_mode = (uint8_t)ctx->setting.water_in_mode;
     persisted->hardness = (uint8_t)ctx->setting.hardness;
     persisted->maint_resume_flag = ctx->maint.resume_flag ? 1U : 0U;
@@ -1193,10 +1479,30 @@ static void sp_pro_import_persisted_settings(app_ctx_t *ctx,
     }
 
     if (sp_pro_persisted_field_available(persisted_size, offsetof(sp_pro_persisted_settings_t, clean_v), sizeof(persisted->clean_v))) {
-        ctx->setting.clean_v = persisted->clean_v;
+        ctx->setting.clean_v = sp_pro_clamp_clean_volume(persisted->clean_v);
     }
     if (sp_pro_persisted_field_available(persisted_size, offsetof(sp_pro_persisted_settings_t, steam_level), sizeof(persisted->steam_level))) {
         ctx->setting.steam_level = persisted->steam_level;
+    }
+    if (sp_pro_persisted_field_available(persisted_size, offsetof(sp_pro_persisted_settings_t, hot_drink_display_scale_delta), sizeof(persisted->hot_drink_display_scale_delta))) {
+        ctx->setting.hot_drink_display_scale_delta =
+            sp_pro_normalize_display_scale_delta(persisted->hot_drink_display_scale_delta);
+    }
+    if (sp_pro_persisted_field_available(persisted_size, offsetof(sp_pro_persisted_settings_t, hot_drink_display_offset_delta), sizeof(persisted->hot_drink_display_offset_delta))) {
+        ctx->setting.hot_drink_display_offset_delta = persisted->hot_drink_display_offset_delta;
+    }
+    if (sp_pro_persisted_field_available(persisted_size, offsetof(sp_pro_persisted_settings_t, hot_drink_stop_ahead_delta), sizeof(persisted->hot_drink_stop_ahead_delta))) {
+        ctx->setting.hot_drink_stop_ahead_delta = persisted->hot_drink_stop_ahead_delta;
+    }
+    if (sp_pro_persisted_field_available(persisted_size, offsetof(sp_pro_persisted_settings_t, hot_water_display_scale_delta), sizeof(persisted->hot_water_display_scale_delta))) {
+        ctx->setting.hot_water_display_scale_delta =
+            sp_pro_normalize_display_scale_delta(persisted->hot_water_display_scale_delta);
+    }
+    if (sp_pro_persisted_field_available(persisted_size, offsetof(sp_pro_persisted_settings_t, hot_water_display_offset_delta), sizeof(persisted->hot_water_display_offset_delta))) {
+        ctx->setting.hot_water_display_offset_delta = persisted->hot_water_display_offset_delta;
+    }
+    if (sp_pro_persisted_field_available(persisted_size, offsetof(sp_pro_persisted_settings_t, hot_water_stop_ahead_delta), sizeof(persisted->hot_water_stop_ahead_delta))) {
+        ctx->setting.hot_water_stop_ahead_delta = persisted->hot_water_stop_ahead_delta;
     }
     if (sp_pro_persisted_field_available(persisted_size, offsetof(sp_pro_persisted_settings_t, water_in_mode), sizeof(persisted->water_in_mode))) {
         ctx->setting.water_in_mode = (setting_water_in_t)persisted->water_in_mode;
@@ -1259,7 +1565,7 @@ static bool sp_pro_load_settings_from_nvs(app_ctx_t *ctx)
     if (size < offsetof(sp_pro_persisted_settings_t, esp_brew_w) + sizeof(persisted.esp_brew_w) ||
         size > sizeof(persisted) ||
         persisted.magic != SP_PRO_SETTINGS_MAGIC ||
-        persisted.version != SP_PRO_SETTINGS_VERSION) {
+        (persisted.version != 2U && persisted.version != SP_PRO_SETTINGS_VERSION)) {
         ESP_LOGW(TAG, "settings blob invalid, ignore (size=%u magic=0x%08lX version=%u)",
                  (unsigned)size,
                  (unsigned long)persisted.magic,
@@ -1317,6 +1623,61 @@ void sp_pro_app_enter_off(void)
     sp_pro_force_visuals_off();
 }
 
+void sp_pro_app_request_remote_power_on(void)
+{
+    s_remote_power_on_request = true;
+}
+
+void sp_pro_app_request_remote_power_off(void)
+{
+    s_remote_power_off_request = true;
+}
+
+void sp_pro_app_enter_clean_brew(void)
+{
+    app_state_t cur = g_ctx.core.state;
+
+    g_ctx.core.state = ST_CLEAN_BREW;
+    g_ctx.core.substate = 0;
+    sp_pro_apply_state_side_effects(cur, ST_CLEAN_BREW);
+}
+
+void sp_pro_app_enter_maint_brew(void)
+{
+    app_state_t cur = g_ctx.core.state;
+
+    g_ctx.core.state = ST_MAINT_BREW;
+    g_ctx.core.substate = 0;
+    sp_pro_apply_state_side_effects(cur, ST_MAINT_BREW);
+}
+
+void sp_pro_app_enter_maint_des(void)
+{
+    app_state_t cur = g_ctx.core.state;
+
+    g_ctx.core.state = ST_MAINT_DES;
+    g_ctx.core.substate = 0;
+    sp_pro_apply_state_side_effects(cur, ST_MAINT_DES);
+}
+
+void sp_pro_app_enter_maint_steam(void)
+{
+    app_state_t cur = g_ctx.core.state;
+
+    g_ctx.core.state = ST_MAINT_STEAM;
+    g_ctx.core.substate = 0;
+    sp_pro_apply_state_side_effects(cur, ST_MAINT_STEAM);
+}
+
+void sp_pro_app_enter_maint_drain(void)
+{
+    app_state_t cur = g_ctx.core.state;
+
+    g_ctx.core.state = ST_MAINT_DRAIN;
+    g_ctx.core.substate = 0;
+    sp_pro_apply_state_side_effects(cur, ST_MAINT_DRAIN);
+}
+
 bool sp_pro_app_toggle_child_lock(void)
 {
     g_ctx.child_lock.enabled = g_ctx.child_lock.enabled ? 0 : 1;
@@ -1328,6 +1689,7 @@ bool sp_pro_app_toggle_child_lock(void)
         g_ctx.core.state = ST_READY;
     }
     g_ctx.core.substate = 0;
+    (void)sp_pro_report_task_status_change_if_needed(false, "child_lock_state_change");
     return g_ctx.child_lock.enabled != 0;
 }
 
@@ -1467,6 +1829,10 @@ static void sp_pro_build_drink_view(const app_ctx_t *ctx, app_drink_view_t *view
     view->target_temp = ctx->drink.target_temp;
     view->display_liquid_ml = sp_pro_get_display_liquid_ml(ctx);
     view->remote_active = (ctx->ctrl.src == CTRL_SRC_MQTT) && (ctx->ctrl.formula != NULL);
+    view->parallel_steam_active = ctx->state_runtime.drink.parallel_steam_active;
+    view->parallel_steam_preheating =
+        view->parallel_steam_active &&
+        (ctx->ms.steam_flag == STEAM_IDLE || ctx->ms.steam_flag == STEAM_UNREADY);
 
     if (view->remote_active &&
         ctx->drink.target_drink == DRINK_AMERICANO &&
@@ -1590,6 +1956,11 @@ bool sp_pro_app_is_brew_handle_in_place(void)
     return g_ctx.ms.brew_handle_postion_flag == 1U;
 }
 
+bool sp_pro_app_is_grind_handle_in_place(void)
+{
+    return g_ctx.ms.grind_handle_postion_flag == 1U;
+}
+
 static void sp_pro_apply_remote_formula_targets(app_ctx_t *ctx,
                                                 const formula_info_t *formula,
                                                 bool water_stage)
@@ -1697,19 +2068,40 @@ bool sp_pro_app_start_remote_drink(const formula_info_t *formula)
     control_action_t stats_action = sp_pro_remote_formula_to_stats_action(formula, next_state);
     device_statistics_notify_remote_action_start(stats_action, formula);
     drink_record_notify_remote_action_start(stats_action, formula);
+    extraction_curve_notify_remote_action_start(stats_action, formula);
 
     g_ctx.core.state = next_state;
+    (void)sp_pro_report_task_status_change_if_needed(false, "remote_task_start");
     return true;
 }
 
 static void sp_pro_build_clear_bean_view(const app_ctx_t *ctx, app_clear_bean_view_t *view)
 {
+    uint32_t elapsed;
+    uint32_t remain;
+
     if (!ctx || !view) {
         return;
     }
 
     memset(view, 0, sizeof(*view));
     view->step = ctx->clear_bean.step;
+
+    if (ctx->clear_bean.step != CLEAR_BEAN_STEP_WAIT_RUN_DELAY) {
+        return;
+    }
+
+    elapsed = ctx->timer.tick - ctx->clear_bean.step_tick;
+    if (elapsed >= CLEAR_BEAN_LOADING_TICKS_VIEW) {
+        view->countdown_seconds = 1U;
+        return;
+    }
+
+    remain = CLEAR_BEAN_LOADING_TICKS_VIEW - elapsed;
+    view->countdown_seconds = (uint8_t)((remain + STAY_TICKS_1S - 1U) / STAY_TICKS_1S);
+    if (view->countdown_seconds == 0U) {
+        view->countdown_seconds = 1U;
+    }
 }
 
 static void sp_pro_build_setting_view(const app_ctx_t *ctx, app_setting_view_t *view)
@@ -2144,8 +2536,10 @@ void sp_pro_update_machine_status(const MACHINE_STATUS *status)
 {
     sp_pro_sync_machine_status(&g_ctx, status);
     sp_pro_check_device_sensor_changed(status);
+    mqtt_handle_remote_maintenance_machine_status(status);
     device_statistics_handle_machine_status(status);
     drink_record_handle_machine_status(status);
+    extraction_curve_handle_machine_status(status);
 }
 
 /* Compatibility wrapper kept for existing callers. */
@@ -2249,6 +2643,20 @@ static void sp_pro_state_dispatch(void)
 
     if (!handler) {
         ESP_LOGW(TAG, "No state handler for state %d", cur);
+        return;
+    }
+
+    next = sp_pro_apply_remote_power_request(cur);
+    if (next != cur) {
+        ESP_LOGI(TAG, "[APP][STATE] %d -> %d", cur, next);
+        g_ctx.core.prev_state = cur;
+        g_ctx.core.state = next;
+        g_ctx.core.substate = 0;
+        g_ctx.input.key_pressed = 0;
+        g_ctx.input.key_long = 0;
+        g_ctx.drink.marquee_tick = 0;
+        g_ctx.drink.marquee_step = 0;
+        sp_pro_apply_state_side_effects(cur, next);
         return;
     }
 
@@ -2376,6 +2784,7 @@ void sp_pro_app_init(void)
     sp_pro_power_key_init();
     memset(&g_ctx, 0, sizeof(g_ctx));
     drink_record_service_init();
+    extraction_curve_service_init();
 
     /* Boot through ST_ON and wait until the controller reports ctr_status=1. */
     g_ctx.core.state = ST_ON;
@@ -2387,6 +2796,7 @@ void sp_pro_app_init(void)
     s_last_auto_power_off_time = -1;
     s_last_auto_stand_by_time = -1;
     s_last_encoder_activity_seq = 0U;
+    s_last_task_status = mqtt_get_task_status();
     sp_pro_refresh_idle_deadlines();
 
     if (xTaskCreate(sp_pro_logic_task, "sp_pro_logic_task", SP_PRO_LOGIC_TASK_STACK_SIZE, NULL, 8, NULL) != pdPASS) {
@@ -2522,6 +2932,36 @@ static app_state_t sp_pro_apply_power_timeout(app_state_t cur)
         sp_pro_clear_idle_deadlines();
         voice_manager_play_touch_tone();
         return ST_OFF;
+    }
+
+    return cur;
+}
+
+static app_state_t sp_pro_apply_remote_power_request(app_state_t cur)
+{
+    bool power_on_request = s_remote_power_on_request;
+    bool power_off_request = s_remote_power_off_request;
+
+    if (!power_on_request && !power_off_request) {
+        return cur;
+    }
+
+    s_remote_power_on_request = false;
+    s_remote_power_off_request = false;
+
+    if (power_off_request) {
+        if (cur != ST_OFF) {
+            sys_pra.power_off_flag = 1;
+            ESP_LOGI(TAG, "Remote power-off request -> ST_OFF");
+            return ST_OFF;
+        }
+        return cur;
+    }
+
+    if (power_on_request && cur == ST_OFF) {
+        sys_pra.power_off_flag = 0;
+        ESP_LOGI(TAG, "Remote power-on request -> ST_ON");
+        return ST_ON;
     }
 
     return cur;

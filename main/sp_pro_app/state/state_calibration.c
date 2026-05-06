@@ -9,16 +9,17 @@ static const char *TAG = "state_cal";
 
 #define DETECTION_CONFIRM_TICKS      STAY_TICKS_2S
 #define DETECTION_CLEAR_BEAN_TICKS   STAY_TICKS(5000)
+#define DETECTION_IGNORED_ERROR_MASK (WATER_PUMP_ERROR | BEANBOX_ERROR)
 #define POWDER_CAL_ADC_DELTA_MIN     100
 #define POWDER_CAL_WEIGHT_DELTA_MIN  0.5f
 #define POWDER_CAL_WEIGHT_GRAMS      500.0f
 #define POWDER_CAL_ADC_SCALE         256.0f
 #define FLOW_CAL_PERCENT_MAX         20
 #define FLOW_CAL_PERCENT_MIN        -20
-#define FLOW_CAL_BASE_HOT_WATER      0.45f
-/* TODO: confirm hot drink default flow coefficient with PRD/CTR side. */
-#define FLOW_CAL_BASE_HOT_DRINK      0.30f
-
+#define FLOW_CAL_HOT_DRINK_REF_ML   60.0f
+#define FLOW_CAL_HOT_WATER_REF_ML  100.0f
+#define FLOW_CAL_STOP_AHEAD_MIN   (-50.0f)
+#define FLOW_CAL_STOP_AHEAD_MAX    (50.0f)
 extern FLASH_FACTORY_DATA factory_data;
 
 static bool detection_grind_handle_present(const app_ctx_t *ctx)
@@ -54,8 +55,24 @@ static bool detection_arm_on_inactive(app_ctx_t *ctx, bool condition_met)
 
     if (!ctx->state_runtime.detection.transition_armed) {
         if (!condition_met) {
+            ESP_LOGI(TAG,
+                     "detection arm transition step=%d armed=0 -> 1 beanbox=%u "
+                     "waterShortage=%u brewHandle=%u grindHandle=%u",
+                     (int)ctx->detection.step,
+                     (unsigned)ctx->ms.beanbox_in_place,
+                     (unsigned)ctx->ms.water_box_shortage_flag,
+                     (unsigned)ctx->ms.brew_handle_postion_flag,
+                     (unsigned)ctx->ms.grind_handle_postion_flag);
             ctx->state_runtime.detection.transition_armed = true;
         } else {
+            ESP_LOGI(TAG,
+                     "detection wait inactive step=%d condition still met beanbox=%u "
+                     "waterShortage=%u brewHandle=%u grindHandle=%u",
+                     (int)ctx->detection.step,
+                     (unsigned)ctx->ms.beanbox_in_place,
+                     (unsigned)ctx->ms.water_box_shortage_flag,
+                     (unsigned)ctx->ms.brew_handle_postion_flag,
+                     (unsigned)ctx->ms.grind_handle_postion_flag);
             ctx->state_runtime.detection.sensor_latched = false;
             ctx->detection.step_tick = ctx->timer.tick;
             return false;
@@ -63,6 +80,17 @@ static bool detection_arm_on_inactive(app_ctx_t *ctx, bool condition_met)
     }
 
     return true;
+}
+
+static uint32_t detection_effective_error_code(const app_ctx_t *ctx)
+{
+    if (!ctx) {
+        return 0U;
+    }
+
+    /* Functional detection needs to tolerate the expected missing-material
+     * conditions it is explicitly asking the operator to create. */
+    return ctx->ms.error_code & ~(DETECTION_IGNORED_ERROR_MASK);
 }
 
 static detection_result_flag_t detection_result_flag_for_step(detection_step_t step)
@@ -321,16 +349,18 @@ static float flow_calibration_current_coeff(const app_ctx_t *ctx)
 
     switch (ctx->calibration.mode) {
     case CAL_MODE_HOT_DRINK:
-        if (factory_data.liquid_k_value > 0.0f) {
-            return factory_data.liquid_k_value;
-        }
-        return FLOW_CAL_BASE_HOT_DRINK;
+        /* Hot-drink cup calibration is presented as an absolute adjustment
+         * around a neutral 100 baseline. Do not re-enter with a previously
+         * compounded display-scale delta, otherwise the UI shows 100 while the
+         * hidden base keeps stacking on each save. */
+        return 1.0f;
 
     case CAL_MODE_HOT_WATER:
-        if (factory_data.flowmeter_coff > 0.0f) {
-            return factory_data.flowmeter_coff;
-        }
-        return FLOW_CAL_BASE_HOT_WATER;
+        /* Hot-water cup calibration is presented as an absolute adjustment
+         * around a neutral 100 baseline. Do not re-enter with a previously
+         * compounded display-scale delta, otherwise the UI shows 100 while the
+         * hidden base keeps stacking on each save. */
+        return 1.0f;
 
     case CAL_MODE_NONE:
     case CAL_MODE_POWDER:
@@ -339,19 +369,96 @@ static float flow_calibration_current_coeff(const app_ctx_t *ctx)
     }
 }
 
-static void flow_calibration_set_coeff(const app_ctx_t *ctx, float coeff)
+static float flow_calibration_reference_target_ml(const app_ctx_t *ctx)
 {
     if (!ctx) {
-        return;
+        return FLOW_CAL_HOT_DRINK_REF_ML;
     }
 
     switch (ctx->calibration.mode) {
     case CAL_MODE_HOT_DRINK:
-        factory_data.liquid_k_value = coeff;
+        return (ctx->setting.esp_brew_w > 0.0f) ? ctx->setting.esp_brew_w : FLOW_CAL_HOT_DRINK_REF_ML;
+
+    case CAL_MODE_HOT_WATER:
+        return (ctx->setting.hot_water_w > 0.0f) ? ctx->setting.hot_water_w : FLOW_CAL_HOT_WATER_REF_ML;
+
+    case CAL_MODE_NONE:
+    case CAL_MODE_POWDER:
+    default:
+        return FLOW_CAL_HOT_DRINK_REF_ML;
+    }
+}
+
+static float flow_calibration_derived_stop_ahead_delta(const app_ctx_t *ctx, float coeff)
+{
+    float ref_target_ml;
+    float delta;
+
+    if (coeff <= 0.0f) {
+        return 0.0f;
+    }
+
+    ref_target_ml = flow_calibration_reference_target_ml(ctx);
+    /* Positive cup-calibration adjustment should increase the real cup volume.
+     * stop_ahead_ml reduces the raw stop threshold (target - stop_ahead), so
+     * the derived delta must move in the opposite direction of coeff:
+     * coeff > 1.0 => more output => more negative stop_ahead delta. */
+    delta = (ref_target_ml / coeff) - ref_target_ml;
+    if (delta < FLOW_CAL_STOP_AHEAD_MIN) {
+        delta = FLOW_CAL_STOP_AHEAD_MIN;
+    } else if (delta > FLOW_CAL_STOP_AHEAD_MAX) {
+        delta = FLOW_CAL_STOP_AHEAD_MAX;
+    }
+
+    return delta;
+}
+
+static float flow_calibration_derived_display_scale_delta(const app_ctx_t *ctx, float coeff)
+{
+    (void)ctx;
+
+    if (coeff <= 0.0f) {
+        return 1.0f;
+    }
+
+    /* Hot-water cup calibration uses an absolute 100-based adjustment UI.
+     * When coeff increases, the raw counter usually runs farther before stop.
+     * Apply the inverse scale so the on-screen volume tends to stay aligned
+     * with the user target instead of inflating together with the later stop. */
+    return 1.0f / coeff;
+}
+
+static void flow_calibration_set_coeff(app_ctx_t *ctx, float coeff)
+{
+    float stop_ahead_delta;
+    float display_scale_delta;
+
+    if (!ctx) {
+        return;
+    }
+
+    stop_ahead_delta = flow_calibration_derived_stop_ahead_delta(ctx, coeff);
+    display_scale_delta = flow_calibration_derived_display_scale_delta(ctx, coeff);
+
+    switch (ctx->calibration.mode) {
+    case CAL_MODE_HOT_DRINK:
+        /* Hot-drink calibration spans espresso / americano brew / cold brew,
+         * each with different base display scales. A single shared display
+         * delta cannot keep all drinks visually aligned to target, and ends up
+         * pulling some drinks far away (for example cold brew 80 -> display 76).
+         * Keep hot-drink display scale neutral and use calibration to correct
+         * the real stop point only. */
+        ctx->setting.hot_drink_display_scale_delta = 1.0f;
+        ctx->setting.hot_drink_stop_ahead_delta = stop_ahead_delta;
         break;
 
     case CAL_MODE_HOT_WATER:
-        factory_data.flowmeter_coff = coeff;
+        /* Hot-water cup calibration should prioritize the real stop point,
+         * but the displayed cup volume should still stay close to the target.
+         * Keep the UI on an absolute 100 baseline and overwrite the display
+         * scale with an inverse absolute delta instead of compounding it. */
+        ctx->setting.hot_water_display_scale_delta = display_scale_delta;
+        ctx->setting.hot_water_stop_ahead_delta = stop_ahead_delta;
         break;
 
     case CAL_MODE_NONE:
@@ -364,6 +471,7 @@ static void flow_calibration_set_coeff(const app_ctx_t *ctx, float coeff)
 static bool flow_calibration_commit(app_ctx_t *ctx)
 {
     float coeff;
+    float stop_ahead_delta;
 
     if (!ctx) {
         return false;
@@ -371,24 +479,25 @@ static bool flow_calibration_commit(app_ctx_t *ctx)
 
     coeff = ctx->state_runtime.calibration.flow_coeff_base *
             (1.0f + ((float)ctx->state_runtime.calibration.flow_adjust_percent / 100.0f));
+    stop_ahead_delta = flow_calibration_derived_stop_ahead_delta(ctx, coeff);
     flow_calibration_set_coeff(ctx, coeff);
 
     ESP_LOGI(TAG,
-             "flow calibration commit mode=%d base=%.8f adjust=%d%% result=%.8f",
+             "cup calibration commit mode=%d base=%.8f adjust=%d%% result=%.8f stop_ahead_delta=%.2f ref_target=%.1f",
              ctx->calibration.mode,
              (double)ctx->state_runtime.calibration.flow_coeff_base,
              (int)ctx->state_runtime.calibration.flow_adjust_percent,
-             (double)coeff);
+             (double)coeff,
+             (double)stop_ahead_delta,
+             (double)flow_calibration_reference_target_ml(ctx));
 
-    if (!ctr_cmd_action(CTRL_ACT_FACTORY_WRITE, NULL)) {
-        ESP_LOGE(TAG, "flow calibration failed to write factory data to CTR");
+    if (!sp_pro_app_save_settings()) {
+        ESP_LOGE(TAG, "cup calibration failed to save settings to NVS");
         return false;
     }
 
-    ctr_factory_data_persist();
-
     mqtt_schedule_device_status_sections_report(MQTT_DEVICE_STATUS_SECTION_CALIBRATION,
-                                                "flow_calibration_done",
+                                                "cup_calibration_done",
                                                 0U);
     return true;
 }
@@ -403,7 +512,7 @@ static void flow_calibration_enter_mode(app_ctx_t *ctx, calibration_mode_t mode)
     ctx->state_runtime.calibration.flow_coeff_base = flow_calibration_current_coeff(ctx);
     ctx->state_runtime.calibration.flow_adjust_percent = 0U;
     ESP_LOGI(TAG,
-             "enter flow calibration mode=%d coeff_base=%.8f",
+             "enter cup calibration mode=%d display_scale_base=%.8f",
              mode,
              (double)ctx->state_runtime.calibration.flow_coeff_base);
     calibration_set_step(ctx, CAL_STEP_RUNNING);
@@ -659,11 +768,15 @@ static app_state_t state_handle_flow_calibration(app_ctx_t *ctx)
                 ctx->state_runtime.calibration.flow_adjust_percent++;
             }
             ESP_LOGI(TAG,
-                     "flow calibration adjust mode=%d percent=%d coeff=%.8f",
+                     "cup calibration adjust mode=%d percent=%d coeff=%.8f stop_ahead_delta=%.2f",
                      ctx->calibration.mode,
                      (int)ctx->state_runtime.calibration.flow_adjust_percent,
                      (double)(ctx->state_runtime.calibration.flow_coeff_base *
-                              (1.0f + ((float)ctx->state_runtime.calibration.flow_adjust_percent / 100.0f))));
+                              (1.0f + ((float)ctx->state_runtime.calibration.flow_adjust_percent / 100.0f))),
+                     (double)flow_calibration_derived_stop_ahead_delta(
+                         ctx,
+                         ctx->state_runtime.calibration.flow_coeff_base *
+                             (1.0f + ((float)ctx->state_runtime.calibration.flow_adjust_percent / 100.0f))));
         }
 
         if (ctx->input.key_pressed & (1U << KEY_TEMP)) {
@@ -672,11 +785,30 @@ static app_state_t state_handle_flow_calibration(app_ctx_t *ctx)
                 ctx->state_runtime.calibration.flow_adjust_percent--;
             }
             ESP_LOGI(TAG,
-                     "flow calibration adjust mode=%d percent=%d coeff=%.8f",
+                     "cup calibration adjust mode=%d percent=%d coeff=%.8f stop_ahead_delta=%.2f",
                      ctx->calibration.mode,
                      (int)ctx->state_runtime.calibration.flow_adjust_percent,
                      (double)(ctx->state_runtime.calibration.flow_coeff_base *
+                              (1.0f + ((float)ctx->state_runtime.calibration.flow_adjust_percent / 100.0f))),
+                     (double)flow_calibration_derived_stop_ahead_delta(
+                         ctx,
+                         ctx->state_runtime.calibration.flow_coeff_base *
                               (1.0f + ((float)ctx->state_runtime.calibration.flow_adjust_percent / 100.0f))));
+        }
+
+        if (ctx->input.key_pressed & (1U << KEY_WIFI)) {
+            ctx->input.key_pressed &= ~(1U << KEY_WIFI);
+            ctx->state_runtime.calibration.flow_adjust_percent = 0;
+            ESP_LOGI(TAG,
+                     "cup calibration reset mode=%d percent=%d coeff=%.8f stop_ahead_delta=%.2f",
+                     ctx->calibration.mode,
+                     (int)ctx->state_runtime.calibration.flow_adjust_percent,
+                     (double)(ctx->state_runtime.calibration.flow_coeff_base *
+                              (1.0f + ((float)ctx->state_runtime.calibration.flow_adjust_percent / 100.0f))),
+                     (double)flow_calibration_derived_stop_ahead_delta(
+                         ctx,
+                         ctx->state_runtime.calibration.flow_coeff_base *
+                             (1.0f + ((float)ctx->state_runtime.calibration.flow_adjust_percent / 100.0f))));
         }
 
         if (ctx->input.key_long & (1U << KEY_STEAM)) {
@@ -738,6 +870,7 @@ app_state_t state_handle_calibration(app_ctx_t *ctx)
 app_state_t state_handle_detection(app_ctx_t *ctx)
 {
     bool condition_met;
+    uint32_t detection_error_code;
 
     if (!ctx) {
         return ST_READY;
@@ -756,8 +889,13 @@ app_state_t state_handle_detection(app_ctx_t *ctx)
         ESP_LOGI(TAG, "enter detection");
     }
 
-    if (ctx->ms.error_code != 0U && ctx->detection.step != DET_STEP_FAIL) {
-        ESP_LOGW(TAG, "detection failed by error_code=0x%08lx", ctx->ms.error_code);
+    detection_error_code = detection_effective_error_code(ctx);
+    if (detection_error_code != 0U && ctx->detection.step != DET_STEP_FAIL) {
+        ESP_LOGW(TAG,
+                 "detection failed by error_code=0x%08lx raw=0x%08lx step=%d",
+                 (unsigned long)detection_error_code,
+                 (unsigned long)ctx->ms.error_code,
+                 (int)ctx->detection.step);
         detection_mark_fail(ctx, detection_result_flag_for_step(ctx->detection.step));
         detection_stop_grinder(ctx);
         detection_set_step(ctx, DET_STEP_FAIL);
@@ -839,7 +977,20 @@ app_state_t state_handle_detection(app_ctx_t *ctx)
 
     case DET_STEP_REMOVE_BEAN_HOPPER:
         condition_met = !detection_bean_hopper_installed(ctx);
+        ESP_LOGI(TAG,
+                 "detection bean remove check beanbox=%u condition=%u armed=%u latched=%u",
+                 (unsigned)ctx->ms.beanbox_in_place,
+                 (unsigned)condition_met,
+                 (unsigned)ctx->state_runtime.detection.transition_armed,
+                 (unsigned)ctx->state_runtime.detection.sensor_latched);
+        if (!detection_arm_on_inactive(ctx, condition_met)) {
+            break;
+        }
         if (condition_met && !ctx->state_runtime.detection.sensor_latched) {
+            ESP_LOGI(TAG,
+                     "detection bean remove latched beanbox=%u tick=%lu",
+                     (unsigned)ctx->ms.beanbox_in_place,
+                     (unsigned long)ctx->timer.tick);
             ctx->state_runtime.detection.sensor_latched = true;
             ctx->detection.step_tick = ctx->timer.tick;
         } else if (!condition_met) {
@@ -848,13 +999,26 @@ app_state_t state_handle_detection(app_ctx_t *ctx)
 
         if (ctx->state_runtime.detection.sensor_latched &&
             (ctx->timer.tick - ctx->detection.step_tick >= DETECTION_CONFIRM_TICKS)) {
+            ESP_LOGI(TAG,
+                     "detection bean remove confirmed beanbox=%u heldTicks=%lu",
+                     (unsigned)ctx->ms.beanbox_in_place,
+                     (unsigned long)(ctx->timer.tick - ctx->detection.step_tick));
             detection_set_step(ctx, DET_STEP_PUTBACK_BEAN_HOPPER);
         }
         break;
 
     case DET_STEP_PUTBACK_BEAN_HOPPER:
         condition_met = detection_bean_hopper_installed(ctx);
+        ESP_LOGI(TAG,
+                 "detection bean install check beanbox=%u condition=%u latched=%u",
+                 (unsigned)ctx->ms.beanbox_in_place,
+                 (unsigned)condition_met,
+                 (unsigned)ctx->state_runtime.detection.sensor_latched);
         if (condition_met && !ctx->state_runtime.detection.sensor_latched) {
+            ESP_LOGI(TAG,
+                     "detection bean install latched beanbox=%u tick=%lu",
+                     (unsigned)ctx->ms.beanbox_in_place,
+                     (unsigned long)ctx->timer.tick);
             ctx->state_runtime.detection.sensor_latched = true;
             ctx->detection.step_tick = ctx->timer.tick;
         } else if (!condition_met) {
@@ -863,6 +1027,10 @@ app_state_t state_handle_detection(app_ctx_t *ctx)
 
         if (ctx->state_runtime.detection.sensor_latched &&
             (ctx->timer.tick - ctx->detection.step_tick >= DETECTION_CONFIRM_TICKS)) {
+            ESP_LOGI(TAG,
+                     "detection bean install confirmed beanbox=%u heldTicks=%lu",
+                     (unsigned)ctx->ms.beanbox_in_place,
+                     (unsigned long)(ctx->timer.tick - ctx->detection.step_tick));
             detection_mark_pass(ctx, DET_RESULT_BEAN_HOPPER);
             detection_set_step(ctx, DET_STEP_UNLOCK_HOPPER);
         }

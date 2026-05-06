@@ -130,6 +130,14 @@ int json_get_int(cJSON *obj, const char *key, int def)
     return def;
 }
 
+float json_get_float(cJSON *obj, const char *key, float def)
+{
+    cJSON *item = cJSON_GetObjectItem(obj, key);
+    if (item && cJSON_IsNumber(item))
+        return (float)item->valuedouble;
+    return def;
+}
+
 const char *json_get_string(cJSON *obj, const char *key, const char *def)
 {
     cJSON *item = cJSON_GetObjectItem(obj, key);

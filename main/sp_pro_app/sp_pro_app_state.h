@@ -63,10 +63,10 @@ void disp_show_weight_with_unit(disp_element_t *d,
                                 float weight,
                                 float target,
                                 bool use_gram_unit);
-void disp_show_flow_coeff(disp_element_t *d,
-                          pos_indicator_t pos,
-                          float coeff,
-                          int8_t adjust_percent);
+void disp_show_cup_calibration(disp_element_t *d,
+                               pos_indicator_t pos,
+                               float coeff,
+                               int8_t adjust_percent);
 void disp_show_brew_yield(disp_element_t *d,
                           pos_indicator_t pos,
                           float value,
@@ -118,6 +118,8 @@ void disp_build_ota_page(const app_display_view_t *view, disp_element_t *d);
 
 drink_liquid_compensation_t sp_pro_get_active_liquid_compensation(const app_ctx_t *ctx);
 float sp_pro_get_raw_liquid_progress_ml(const app_ctx_t *ctx);
+float sp_pro_apply_liquid_display_compensation(float raw_progress_ml,
+                                               drink_liquid_compensation_t comp);
 float sp_pro_get_display_liquid_ml(const app_ctx_t *ctx);
 
 app_state_t state_handle_off(app_ctx_t *ctx);

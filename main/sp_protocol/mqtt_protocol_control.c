@@ -8,8 +8,11 @@
 #include "formula_store.h"
 #include "device_statistics_store.h"
 #include "drink_record_service.h"
+#include "extraction_curve_service.h"
 #include "mqtt_protocol.h"
 #include "sp_pro_app_ctrl.h"
+#include "sp_pro_app_context.h"
+#include "esp_timer.h"
 
 static const char *TAG = "MQTT_PROTOCOL";
 
@@ -28,8 +31,28 @@ typedef struct {
     char msg[128];
     ack_sensor_info_t sensors[4];
     int sensors_count;
+    int results[4];
+    int results_count;
     mqtt_ack_topic_t ack_topic;
 } mqtt_command_ack_t;
+
+typedef struct {
+    bool pending;
+    int setting_type;
+    char msg_id[64];
+    bool machine_started;
+    int64_t idle_since_ms;
+} mqtt_remote_completion_ack_t;
+
+typedef struct {
+    bool pending;
+    int cleaning_mode;
+    char msg_id[64];
+    bool machine_started;
+    bool failed;
+    int64_t idle_since_ms;
+    uint32_t last_results_mask;
+} mqtt_remote_cleaning_ack_t;
 
 typedef enum {
     FORMULA_CMD_SRC_INVALID = 0,
@@ -39,7 +62,14 @@ typedef enum {
 
 extern FLASH_FACTORY_DATA factory_data;
 
+static mqtt_remote_completion_ack_t s_remote_controller_completion_acks[2] = {0};
+static mqtt_remote_cleaning_ack_t s_remote_cleaning_ack = {0};
+
 static bool mqtt_cmd_no_equals(const char *cmd_no, const char *expected);
+static mqtt_remote_completion_ack_t *mqtt_find_remote_completion_slot(int setting_type);
+static mqtt_remote_completion_ack_t *mqtt_alloc_remote_completion_slot(int setting_type);
+static int64_t mqtt_remote_ack_now_ms(void);
+static bool mqtt_remote_maint_active(const MACHINE_STATUS *status);
 
 static void mqtt_publish_followup_status_after_control(int cmd_type,
                                                        const char *cmd_no,
@@ -124,6 +154,28 @@ static bool mqtt_cmd_no_equals(const char *cmd_no, const char *expected)
     return cmd_no != NULL && expected != NULL && strcmp(cmd_no, expected) == 0;
 }
 
+static int64_t mqtt_remote_ack_now_ms(void)
+{
+    return esp_timer_get_time() / 1000LL;
+}
+
+static bool mqtt_remote_maint_active(const MACHINE_STATUS *status)
+{
+    app_state_t app_state = sp_pro_app_get_state();
+
+    if (!status) {
+        return false;
+    }
+
+    return (status->drink_making_flg == DRINK_MAKER_MAINTANCE) ||
+           (status->hot_water_flg != 0U) ||
+           (app_state == ST_CLEAN_BREW) ||
+           (app_state == ST_MAINT_BREW) ||
+           (app_state == ST_MAINT_DES) ||
+           (app_state == ST_MAINT_STEAM) ||
+           (app_state == ST_MAINT_DRAIN);
+}
+
 static void mqtt_set_command_ack(mqtt_command_ack_t *command_ack, int ack_code, const char *msg)
 {
     if (!command_ack)
@@ -131,8 +183,250 @@ static void mqtt_set_command_ack(mqtt_command_ack_t *command_ack, int ack_code, 
 
     command_ack->ack_code = ack_code;
     command_ack->sensors_count = 0;
+    command_ack->results_count = 0;
     command_ack->ack_topic = MQTT_ACK_TOPIC_REMOTE_CTRL;
     snprintf(command_ack->msg, sizeof(command_ack->msg), "%s", msg ? msg : "");
+}
+
+static void mqtt_ensure_command_ack_failure(mqtt_command_ack_t *command_ack, const char *fallback_msg)
+{
+    if (!command_ack) {
+        return;
+    }
+
+    if (command_ack->ack_code == 0) {
+        mqtt_set_command_ack(command_ack, -1, fallback_msg);
+        return;
+    }
+
+    if (command_ack->msg[0] == '\0' && fallback_msg) {
+        snprintf(command_ack->msg, sizeof(command_ack->msg), "%s", fallback_msg);
+    }
+}
+
+static mqtt_remote_completion_ack_t *mqtt_find_remote_completion_slot(int setting_type)
+{
+    for (size_t i = 0; i < sizeof(s_remote_controller_completion_acks) / sizeof(s_remote_controller_completion_acks[0]); ++i) {
+        if (s_remote_controller_completion_acks[i].pending &&
+            s_remote_controller_completion_acks[i].setting_type == setting_type) {
+            return &s_remote_controller_completion_acks[i];
+        }
+    }
+
+    return NULL;
+}
+
+static mqtt_remote_completion_ack_t *mqtt_alloc_remote_completion_slot(int setting_type)
+{
+    mqtt_remote_completion_ack_t *empty_slot = NULL;
+
+    for (size_t i = 0; i < sizeof(s_remote_controller_completion_acks) / sizeof(s_remote_controller_completion_acks[0]); ++i) {
+        if (s_remote_controller_completion_acks[i].pending &&
+            s_remote_controller_completion_acks[i].setting_type == setting_type) {
+            return &s_remote_controller_completion_acks[i];
+        }
+
+        if (!s_remote_controller_completion_acks[i].pending && empty_slot == NULL) {
+            empty_slot = &s_remote_controller_completion_acks[i];
+        }
+    }
+
+    return empty_slot;
+}
+
+void mqtt_track_remote_controller_completion(const char *msg_id, int setting_type)
+{
+    mqtt_remote_completion_ack_t *slot;
+
+    if (!msg_id || msg_id[0] == 0) {
+        return;
+    }
+
+    if (setting_type != SETTING_TYPE_CLEAR_WATERWAY &&
+        setting_type != SETTING_TYPE_BREW_CLEAN) {
+        return;
+    }
+
+    slot = mqtt_alloc_remote_completion_slot(setting_type);
+    if (!slot) {
+        ESP_LOGW(TAG,
+                 "Drop remote controller completion tracking because no slot is available, settingType=%d msgId=%s",
+                 setting_type,
+                 msg_id);
+        return;
+    }
+
+    slot->pending = true;
+    slot->setting_type = setting_type;
+    snprintf(slot->msg_id, sizeof(slot->msg_id), "%s", msg_id);
+    ESP_LOGI(TAG,
+             "Track remote controller completion settingType=%d msgId=%s",
+             setting_type,
+             slot->msg_id);
+}
+
+void mqtt_clear_remote_controller_completion(int setting_type)
+{
+    mqtt_remote_completion_ack_t *slot = mqtt_find_remote_completion_slot(setting_type);
+
+    if (!slot) {
+        return;
+    }
+
+    memset(slot, 0, sizeof(*slot));
+}
+
+static void mqtt_add_ack_result(mqtt_command_ack_t *command_ack, int result)
+{
+    if (!command_ack || command_ack->results_count >= (int)(sizeof(command_ack->results) / sizeof(command_ack->results[0]))) {
+        return;
+    }
+
+    command_ack->results[command_ack->results_count++] = result;
+}
+
+void mqtt_notify_remote_controller_complete(int setting_type, bool success)
+{
+    mqtt_remote_completion_ack_t *slot = mqtt_find_remote_completion_slot(setting_type);
+
+    if (!slot) {
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "Publish remote controller completion ack settingType=%d msgId=%s success=%d",
+             setting_type,
+             slot->msg_id,
+             success ? 1 : 0);
+    publish_drink_ack_to_mqtt(slot->msg_id,
+                              success ? 2 : -1,
+                              NULL,
+                              0,
+                              success ? "complete" : "failed");
+    memset(slot, 0, sizeof(*slot));
+}
+
+static void mqtt_track_remote_cleaning_ack(const char *msg_id, int cleaning_mode)
+{
+    if (!msg_id || msg_id[0] == 0) {
+        return;
+    }
+
+    memset(&s_remote_cleaning_ack, 0, sizeof(s_remote_cleaning_ack));
+    s_remote_cleaning_ack.pending = true;
+    s_remote_cleaning_ack.cleaning_mode = cleaning_mode;
+    snprintf(s_remote_cleaning_ack.msg_id, sizeof(s_remote_cleaning_ack.msg_id), "%s", msg_id);
+    ESP_LOGI(TAG,
+             "Track remote cleaning ack cleaningMode=%d msgId=%s",
+             cleaning_mode,
+             s_remote_cleaning_ack.msg_id);
+}
+
+static void mqtt_clear_remote_cleaning_ack(void)
+{
+    memset(&s_remote_cleaning_ack, 0, sizeof(s_remote_cleaning_ack));
+}
+
+void mqtt_handle_remote_maintenance_machine_status(const MACHINE_STATUS *status)
+{
+    int64_t now_ms;
+    uint32_t abnormal_mask = 0U;
+    int results[2];
+    int results_count = 0;
+
+    if (!status) {
+        return;
+    }
+
+    now_ms = mqtt_remote_ack_now_ms();
+
+    for (size_t i = 0; i < sizeof(s_remote_controller_completion_acks) / sizeof(s_remote_controller_completion_acks[0]); ++i) {
+        mqtt_remote_completion_ack_t *slot = &s_remote_controller_completion_acks[i];
+
+        if (!slot->pending) {
+            continue;
+        }
+
+        if (mqtt_remote_maint_active(status)) {
+            slot->machine_started = true;
+            slot->idle_since_ms = 0;
+            continue;
+        }
+
+        if (!slot->machine_started) {
+            continue;
+        }
+
+        if (slot->idle_since_ms == 0) {
+            slot->idle_since_ms = now_ms;
+            continue;
+        }
+
+        if ((now_ms - slot->idle_since_ms) >= 3000LL) {
+            mqtt_notify_remote_controller_complete(slot->setting_type, status->error_code == 0U);
+        }
+    }
+
+    if (!s_remote_cleaning_ack.pending) {
+        return;
+    }
+
+    if (status->water_box_shortage_flag) {
+        abnormal_mask |= (1U << 1);
+    }
+    if (s_remote_cleaning_ack.cleaning_mode == CLEANING_MODE_BREW &&
+        !status->brew_handle_postion_flag) {
+        abnormal_mask |= (1U << 0);
+    }
+
+    if (abnormal_mask != s_remote_cleaning_ack.last_results_mask) {
+        int progress_ack_code = s_remote_cleaning_ack.machine_started ? 1 : 0;
+
+        if ((abnormal_mask & (1U << 0)) != 0U) {
+            results[results_count++] = 1;
+        }
+        if ((abnormal_mask & (1U << 1)) != 0U) {
+            results[results_count++] = 2;
+        }
+        publish_cleaning_ack_to_mqtt(s_remote_cleaning_ack.msg_id,
+                                     progress_ack_code,
+                                     results_count > 0 ? results : NULL,
+                                     results_count,
+                                     results_count > 0 ? "running" : "");
+        s_remote_cleaning_ack.last_results_mask = abnormal_mask;
+    }
+
+    if (mqtt_remote_maint_active(status)) {
+        s_remote_cleaning_ack.machine_started = true;
+        s_remote_cleaning_ack.idle_since_ms = 0;
+        if (status->error_code != 0U) {
+            s_remote_cleaning_ack.failed = true;
+        }
+        return;
+    }
+
+    if (!s_remote_cleaning_ack.machine_started) {
+        return;
+    }
+
+    if (status->error_code != 0U) {
+        s_remote_cleaning_ack.failed = true;
+    }
+
+    if (s_remote_cleaning_ack.idle_since_ms == 0) {
+        s_remote_cleaning_ack.idle_since_ms = now_ms;
+        return;
+    }
+
+    if ((now_ms - s_remote_cleaning_ack.idle_since_ms) >= 3000LL) {
+        int final_result = s_remote_cleaning_ack.failed ? 2 : 1;
+        publish_cleaning_ack_to_mqtt(s_remote_cleaning_ack.msg_id,
+                                     2,
+                                     &final_result,
+                                     1,
+                                     s_remote_cleaning_ack.failed ? "failed" : "complete");
+        mqtt_clear_remote_cleaning_ack();
+    }
 }
 
 static void mqtt_add_ack_sensor(mqtt_command_ack_t *command_ack, const char *name, int status)
@@ -155,18 +449,18 @@ static void dump_master_formula(formula_info_t *formula)
     ESP_LOGI(TAG, "formula_id: %lu", formula->formula_id);
     ESP_LOGI(TAG, "formula_name: %s", formula->formula_name);
     ESP_LOGI(TAG, "formula_remark: %s", formula->formula_remark);
-    ESP_LOGI(TAG, "drink_id: %d", formula->drink_id);
+    ESP_LOGI(TAG, "drink_id: %d", (int)formula->drink_id);
     ESP_LOGI(TAG, "drink_name: %s", formula->drink_name);
-    ESP_LOGI(TAG, "label_id: %d", formula->label_id);
+    ESP_LOGI(TAG, "label_id: %d", (int)formula->label_id);
     ESP_LOGI(TAG, "label: %s", formula->label);
-    ESP_LOGI(TAG, "grind_range: %d", formula->grind_range);
-    ESP_LOGI(TAG, "grind_weight: %d", formula->grind_weight);
-    ESP_LOGI(TAG, "preset_temperature: %d", formula->preset_temperature);
-    ESP_LOGI(TAG, "preset_liquid_weight: %d", formula->preset_liquid_weight);
-    ESP_LOGI(TAG, "water_temperature: %d", formula->water_temperature);
-    ESP_LOGI(TAG, "water_weight: %d", formula->water_weight);
-    ESP_LOGI(TAG, "milk_temperature: %d", formula->milk_temperature);
-    ESP_LOGI(TAG, "stage_priority: %d", formula->stage_priority);
+    ESP_LOGI(TAG, "grind_range: %d", (int)formula->grind_range);
+    ESP_LOGI(TAG, "grind_weight: %.1f", formula->grind_weight);
+    ESP_LOGI(TAG, "preset_temperature: %d", (int)formula->preset_temperature);
+    ESP_LOGI(TAG, "preset_liquid_weight: %d", (int)formula->preset_liquid_weight);
+    ESP_LOGI(TAG, "water_temperature: %d", (int)formula->water_temperature);
+    ESP_LOGI(TAG, "water_weight: %d", (int)formula->water_weight);
+    ESP_LOGI(TAG, "milk_temperature: %d", (int)formula->milk_temperature);
+    ESP_LOGI(TAG, "stage_priority: %d", (int)formula->stage_priority);
     ESP_LOGI(TAG, "prebrew: status=%u water=%u flow=%u time=%u",
              formula->prebrew.status,
              formula->prebrew.water_volume,
@@ -174,7 +468,7 @@ static void dump_master_formula(formula_info_t *formula)
              formula->prebrew.wait_time);
     ESP_LOGI(TAG, "pressure_stage_cnt: %u", formula->pressure_stage_cnt);
     for (int i = 0; i < formula->pressure_stage_cnt; i++) {
-        ESP_LOGI(TAG, "pressure_stage[%d]: pressure=%u wait=%u",
+        ESP_LOGI(TAG, "pressure_stage[%d]: pressure=%.1f wait=%u",
                  i,
                  formula->pressure_stage[i].pressure,
                  formula->pressure_stage[i].wait_time);
@@ -247,7 +541,7 @@ static bool mqtt_start_grind_action(formula_info_t *formula)
         return false;
 
     sp_pro_app_set_ctrl_src(CTRL_SRC_MQTT);
-    ESP_LOGI(TAG, "[MQTT][GRIND] record_id=%lu grind_range=%d grind_weight=%d", formula->record_id, formula->grind_range, formula->grind_weight);
+    ESP_LOGI(TAG, "[MQTT][GRIND] record_id=%lu grind_range=%d grind_weight=%.1f", formula->record_id, formula->grind_range, formula->grind_weight);
     if (ctr_cmd_action(CTRL_ACT_GRIND_START, formula)) {
         device_statistics_notify_remote_action_start(CTRL_ACT_GRIND_START, formula);
         drink_record_notify_remote_action_start(CTRL_ACT_GRIND_START, formula);
@@ -272,9 +566,32 @@ static bool parse_grind_cmd_from_mqtt(cJSON *param, mqtt_command_ack_t *command_
         return false;
     }
 
-    if (!formula_store_get_formula(0U, record_id, &formula)) {
-        mqtt_set_command_ack(command_ack, -1, "local grind formula not found");
+    if (!sp_pro_app_is_grind_handle_in_place()) {
+        mqtt_set_command_ack(command_ack, -1, "grind handle not in place");
+        mqtt_add_ack_sensor(command_ack, "grind_handle_postion_flag", 1);
         return false;
+    }
+
+    if (!formula_store_get_formula(0U, record_id, &formula)) {
+        if (!mqtt_parse_formula_from_json(param, &formula) ||
+            (formula.grind_weight <= 0.0f && formula.grind_range == 0U)) {
+            mqtt_set_command_ack(command_ack, -1, "local grind formula not found");
+            return false;
+        }
+
+        formula.record_id = record_id;
+        if (formula.formula_id == 0U) {
+            formula.formula_id = record_id;
+        }
+        if (formula.drink_id == 0U) {
+            formula.drink_id = DRINK_ID_MASTER;
+        }
+
+        ESP_LOGI(TAG,
+                 "[MQTT][GRIND] fallback to inline grind params for record_id=%lu grind_range=%u grind_weight=%.1f",
+                 (unsigned long)formula.record_id,
+                 (unsigned int)formula.grind_range,
+                 formula.grind_weight);
     }
 
     return mqtt_start_grind_action(&formula);
@@ -445,7 +762,7 @@ static void publish_internal_test_ack_to_mqtt(const char *msg_id,
 }
 #endif
 
-static bool mqtt_apply_remote_setting(cJSON *param, mqtt_command_ack_t *command_ack)
+static bool mqtt_apply_remote_setting(const char *msg_id, cJSON *param, mqtt_command_ack_t *command_ack)
 {
     if (!param)
     {
@@ -461,11 +778,19 @@ static bool mqtt_apply_remote_setting(cJSON *param, mqtt_command_ack_t *command_
     case SETTING_TYPE_AUTO_POWER_OFF:
         mqtt_runtime_setting.auto_power_off_time = json_get_int(param, "autoPowerOffTime", mqtt_runtime_setting.auto_power_off_time);
         mqtt_normalize_runtime_setting();
+        if (!mqtt_save_runtime_setting()) {
+            mqtt_set_command_ack(command_ack, -1, "save auto power off failed");
+            return false;
+        }
         break;
 
     case SETTING_TYPE_AUTO_STANDBY:
         mqtt_runtime_setting.auto_stand_by_time = json_get_int(param, "autoStandByTime", mqtt_runtime_setting.auto_stand_by_time);
         mqtt_normalize_runtime_setting();
+        if (!mqtt_save_runtime_setting()) {
+            mqtt_set_command_ack(command_ack, -1, "save auto standby failed");
+            return false;
+        }
         break;
 
     case SETTING_TYPE_SOUND:
@@ -473,6 +798,10 @@ static bool mqtt_apply_remote_setting(cJSON *param, mqtt_command_ack_t *command_
         mqtt_runtime_setting.voice_prompt = json_get_int(param, "voicePrompt", mqtt_runtime_setting.voice_prompt);
         mqtt_runtime_setting.voice_volume = json_get_int(param, "voiceVolume", mqtt_runtime_setting.voice_volume);
         mqtt_normalize_runtime_setting();
+        if (!mqtt_save_runtime_setting()) {
+            mqtt_set_command_ack(command_ack, -1, "save sound setting failed");
+            return false;
+        }
         break;
 
     case SETTING_TYPE_AUTO_CLEAR_BEAN:
@@ -495,20 +824,36 @@ static bool mqtt_apply_remote_setting(cJSON *param, mqtt_command_ack_t *command_
     case SETTING_TYPE_BREW_WATER_VOLUME:
         mqtt_runtime_setting.brew_water_volume = json_get_int(param, "brewWaterVolume", mqtt_runtime_setting.brew_water_volume);
         sp_pro_app_set_clean_volume((float)mqtt_runtime_setting.brew_water_volume);
+        mqtt_sync_runtime_setting_from_device();
+        if (!sp_pro_app_save_settings()) {
+            mqtt_set_command_ack(command_ack, -1, "save brew water volume failed");
+            return false;
+        }
         break;
 
     case SETTING_TYPE_WATER_INTAKE_MODE:
         mqtt_runtime_setting.water_intake_mode = json_get_int(param, "waterIntakeMode", mqtt_runtime_setting.water_intake_mode) ? 1 : 0;
         factory_data.water_supply_mode = mqtt_runtime_setting.water_intake_mode;
         sp_pro_app_set_water_in_mode(mqtt_runtime_setting.water_intake_mode ? WATER_IN_MODE_BUCKET : WATER_IN_MODE_TANK);
+        mqtt_sync_runtime_setting_from_device();
+        if (!sp_pro_app_save_settings()) {
+            mqtt_set_command_ack(command_ack, -1, "save water intake mode failed");
+            return false;
+        }
+        if (!ctr_cmd_action(CTRL_ACT_FACTORY_WRITE, NULL)) {
+            mqtt_set_command_ack(command_ack, -1, "water intake mode factory write failed");
+            return false;
+        }
         break;
 
     case SETTING_TYPE_CLEAR_WATERWAY:
-        if (!mqtt_try_run_action(CTRL_ACT_DRAIN, NULL))
-        {
-            mqtt_set_command_ack(command_ack, -1, "clear waterway failed");
+        if (mqtt_get_task_status() != 0 && mqtt_get_task_status() != 22) {
+            mqtt_set_command_ack(command_ack, -1, "coffee machine busy");
             return false;
         }
+        sp_pro_app_set_ctrl_src(CTRL_SRC_MQTT);
+        sp_pro_app_enter_maint_drain();
+        mqtt_track_remote_controller_completion(msg_id, SETTING_TYPE_CLEAR_WATERWAY);
         break;
 
     case SETTING_TYPE_REMOTE_CLEAN:
@@ -516,12 +861,42 @@ static bool mqtt_apply_remote_setting(cJSON *param, mqtt_command_ack_t *command_
         int cleaning_mode = json_get_int(param, "cleaningMode", -1);
         bool ok = false;
         command_ack->ack_topic = MQTT_ACK_TOPIC_CLEANING;
-        if (cleaning_mode == CLEANING_MODE_BREW)
-            ok = mqtt_try_run_action(CTRL_ACT_MAINT_BREW1, NULL);
-        else if (cleaning_mode == CLEANING_MODE_STEAM)
-            ok = mqtt_try_run_action(CTRL_ACT_MAINT_STEAM, NULL);
-        else if (cleaning_mode == CLEANING_MODE_DESCALING)
-            ok = mqtt_try_run_action(CTRL_ACT_MAINT_DES1, NULL);
+
+        if (mqtt_get_task_status() != 0 && mqtt_get_task_status() != 22) {
+            mqtt_set_command_ack(command_ack, -1, "coffee machine busy");
+            mqtt_add_ack_result(command_ack, 1);
+            return false;
+        }
+
+        if (cleaning_mode == CLEANING_MODE_BREW && !sp_pro_app_is_brew_handle_in_place()) {
+            mqtt_set_command_ack(command_ack, -1, "brew handle not installed");
+            mqtt_add_ack_result(command_ack, 3);
+            return false;
+        }
+
+        if (cleaning_mode == CLEANING_MODE_DESCALING && factory_data.water_supply_mode != 0) {
+            mqtt_set_command_ack(command_ack, -1, "water tank mode required");
+            mqtt_add_ack_result(command_ack, 4);
+            return false;
+        }
+
+        if (g_ctx.ms.water_box_shortage_flag) {
+            mqtt_set_command_ack(command_ack, -1, "water shortage");
+            mqtt_add_ack_result(command_ack, cleaning_mode == CLEANING_MODE_DESCALING ? 5 : 2);
+            return false;
+        }
+
+        sp_pro_app_set_ctrl_src(CTRL_SRC_MQTT);
+        if (cleaning_mode == CLEANING_MODE_BREW) {
+            sp_pro_app_enter_maint_brew();
+            ok = true;
+        } else if (cleaning_mode == CLEANING_MODE_STEAM) {
+            sp_pro_app_enter_maint_steam();
+            ok = true;
+        } else if (cleaning_mode == CLEANING_MODE_DESCALING) {
+            sp_pro_app_enter_maint_des();
+            ok = true;
+        }
 
         if (!ok)
         {
@@ -529,6 +904,7 @@ static bool mqtt_apply_remote_setting(cJSON *param, mqtt_command_ack_t *command_
             return false;
         }
         mqtt_mark_clean_result_incomplete(cleaning_mode);
+        mqtt_track_remote_cleaning_ack(msg_id, cleaning_mode);
         break;
     }
 
@@ -540,6 +916,7 @@ static bool mqtt_apply_remote_setting(cJSON *param, mqtt_command_ack_t *command_
         }
         device_statistics_notify_remote_cancel();
         drink_record_notify_remote_cancel();
+        extraction_curve_notify_remote_cancel();
         break;
 
     case SETTING_TYPE_CANCEL_EXTRACTION:
@@ -549,16 +926,21 @@ static bool mqtt_apply_remote_setting(cJSON *param, mqtt_command_ack_t *command_
             mqtt_set_command_ack(command_ack, -1, "cancel action failed");
             return false;
         }
+        mqtt_clear_remote_controller_completion(SETTING_TYPE_BREW_CLEAN);
+        mqtt_clear_remote_cleaning_ack();
         device_statistics_notify_remote_cancel();
         drink_record_notify_remote_cancel();
+        extraction_curve_notify_remote_cancel();
         break;
 
     case SETTING_TYPE_BREW_CLEAN:
-        if (!mqtt_try_run_action(CTRL_ACT_CLEAN_BREW, NULL))
-        {
-            mqtt_set_command_ack(command_ack, -1, "brew clean failed");
+        if (!sp_pro_app_is_brew_handle_in_place()) {
+            mqtt_set_command_ack(command_ack, -1, "brew handle missing");
             return false;
         }
+        sp_pro_app_set_ctrl_src(CTRL_SRC_MQTT);
+        sp_pro_app_enter_clean_brew();
+        mqtt_track_remote_controller_completion(msg_id, SETTING_TYPE_BREW_CLEAN);
         break;
 
     default:
@@ -644,23 +1026,19 @@ static bool parse_formula_cmd_from_mqtt(cJSON *param, mqtt_command_ack_t *comman
     return true;
 }
 
-static bool parse_other_cmd_from_mqtt(const char *cmd_no, cJSON *param, mqtt_command_ack_t *command_ack)
+static bool parse_other_cmd_from_mqtt(const char *msg_id, const char *cmd_no, cJSON *param, mqtt_command_ack_t *command_ack)
 {
     ESP_LOGI(TAG, "========== OTHER CMD DUMP ==========");
     ESP_LOGI(TAG, "cmd_no: %s", cmd_no ? cmd_no : "<null>");
     mqtt_set_command_ack(command_ack, 0, "OK");
 
     if (mqtt_cmd_no_equals(cmd_no, CMD_NO_REMOTE_POWER_ON)) {
-        sys_pra.power_off_flag = 0;
-        if (sp_pro_app_is_off()) {
-            sp_pro_app_enter_on();
-        }
+        sp_pro_app_request_remote_power_on();
         return true;
     }
 
     if (mqtt_cmd_no_equals(cmd_no, CMD_NO_REMOTE_POWER_OFF)) {
-        sys_pra.power_off_flag = 1;
-        sp_pro_app_enter_off();
+        sp_pro_app_request_remote_power_off();
         return true;
     }
 
@@ -670,8 +1048,7 @@ static bool parse_other_cmd_from_mqtt(const char *cmd_no, cJSON *param, mqtt_com
         device_statistics_factory_reset();
         mqtt_set_formula_force_update_pending(true);
         formula_store_set_force_update(true);
-        sys_pra.power_off_flag = 1;
-        sp_pro_app_enter_off();
+        sp_pro_app_request_remote_power_off();
         return true;
     }
 
@@ -695,7 +1072,7 @@ static bool parse_other_cmd_from_mqtt(const char *cmd_no, cJSON *param, mqtt_com
     }
 
     if (mqtt_cmd_no_equals(cmd_no, CMD_NO_REMOTE_PARAM_SETTING)) {
-        return mqtt_apply_remote_setting(param, command_ack);
+        return mqtt_apply_remote_setting(msg_id, param, command_ack);
     }
 
 #if MQTT_INTERNAL_TEST_ENABLE
@@ -735,16 +1112,16 @@ bool mqtt_handle_control_data_from_mqtt(const char *msg_id, cJSON *data)
 
     case CMD_TYPE_GRIND:
         if (!parse_grind_cmd_from_mqtt(param, &command_ack))
-            mqtt_set_command_ack(&command_ack, command_ack.ack_code == 0 ? -1 : command_ack.ack_code, command_ack.msg[0] ? command_ack.msg : "invalid grind param");
+            mqtt_ensure_command_ack_failure(&command_ack, "invalid grind param");
         break;
 
     case CMD_TYPE_MASTER:
         if (!parse_formula_cmd_from_mqtt(param, &command_ack))
-            mqtt_set_command_ack(&command_ack, command_ack.ack_code == 0 ? -1 : command_ack.ack_code, command_ack.msg[0] ? command_ack.msg : "invalid formula param");
+            mqtt_ensure_command_ack_failure(&command_ack, "invalid formula param");
         break;
 
     case CMD_TYPE_OTHER:
-        parse_other_cmd_from_mqtt(cmd_no, param, &command_ack);
+        parse_other_cmd_from_mqtt(msg_id, cmd_no, param, &command_ack);
         break;
 
     default:
@@ -765,6 +1142,8 @@ bool mqtt_handle_control_data_from_mqtt(const char *msg_id, cJSON *data)
         } else if (command_ack.ack_topic == MQTT_ACK_TOPIC_CLEANING) {
             publish_cleaning_ack_to_mqtt(msg_id,
                                          command_ack.ack_code,
+                                         command_ack.results_count > 0 ? command_ack.results : NULL,
+                                         command_ack.results_count,
                                          command_ack.msg);
         } else {
             publish_drink_ack_to_mqtt(msg_id,
@@ -814,6 +1193,8 @@ void publish_drink_ack_to_mqtt(const char *msg_id,
 
 void publish_cleaning_ack_to_mqtt(const char *msg_id,
                                   int ack_code,
+                                  const int *results,
+                                  int results_count,
                                   const char *msg)
 {
     cJSON *data = NULL;
@@ -826,6 +1207,13 @@ void publish_cleaning_ack_to_mqtt(const char *msg_id,
 
     cleaning_ack = cJSON_CreateObject();
     cJSON_AddNumberToObject(cleaning_ack, "ackCode", ack_code);
+    if (results != NULL && results_count > 0) {
+        cJSON *results_arr = cJSON_CreateArray();
+        for (int i = 0; i < results_count; ++i) {
+            cJSON_AddItemToArray(results_arr, cJSON_CreateNumber(results[i]));
+        }
+        cJSON_AddItemToObject(cleaning_ack, "results", results_arr);
+    }
     if (msg != NULL) {
         cJSON_AddStringToObject(cleaning_ack, "msg", msg);
     }

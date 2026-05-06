@@ -1,4 +1,5 @@
 #include "sp_pro_app.h"
+#include "sp_pro_build_flags.h"
 #include <stddef.h>
 #include "esp_log.h"
 #include "device_statistics_store.h"
@@ -294,8 +295,11 @@ static bool alarm_find_notice(app_ctx_t *ctx, alarm_notice_t *notice)
         ctx->core.state == ST_LOCK ||
         ctx->core.state == ST_SETTING ||
         ctx->core.state == ST_DRINK_SET) {
+        bool hopper_notice_active = (ctx->ms.beanbox_in_place == 0U) ||
+                                    ctx->state_runtime.clear_bean.post_clean_notice_pending;
+
         if (ctx->ms.water_box_shortage_flag &&
-            (ctx->ms.beanbox_in_place == 0U) &&
+            hopper_notice_active &&
             !clear_bean_should_suppress_hopper_notice(ctx)) {
             notice->indicator = BF_STATUS_P1;
             notice->warning = WARN_WATER_BEAN_MISS;
@@ -310,7 +314,7 @@ static bool alarm_find_notice(app_ctx_t *ctx, alarm_notice_t *notice)
             return true;
         }
 
-        if ((ctx->ms.beanbox_in_place == 0U) && !clear_bean_should_suppress_hopper_notice(ctx)) {
+        if (hopper_notice_active && !clear_bean_should_suppress_hopper_notice(ctx)) {
             notice->indicator = BF_STATUS_P2;
             notice->warning = WARN_BEAN_MISS;
             notice->notice_type = MAINT_TYPE_NONE;
@@ -319,7 +323,9 @@ static bool alarm_find_notice(app_ctx_t *ctx, alarm_notice_t *notice)
     }
 
     /* Bean hopper missing in other scenes is a non-blocking popup. */
-    if ((ctx->ms.beanbox_in_place == 0U) && !clear_bean_should_suppress_hopper_notice(ctx)) {
+    if (((ctx->ms.beanbox_in_place == 0U) ||
+         ctx->state_runtime.clear_bean.post_clean_notice_pending) &&
+        !clear_bean_should_suppress_hopper_notice(ctx)) {
         notice->indicator = BF_STATUS_P2;
         notice->warning = WARN_BEAN_MISS;
         notice->notice_type = MAINT_TYPE_NONE;
@@ -660,6 +666,33 @@ static void alarm_handle_heater_fault(app_ctx_t *ctx)
     ESP_LOGW(TAG, "H01 fault cancel current process to protect heater");
 }
 
+static void alarm_try_start_water_pump_replenish(app_ctx_t *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+
+    if (ctx->state_runtime.alarm.water_pump_replenishing) {
+        ESP_LOGI(TAG, "H05 replenish ignored: already running");
+        return;
+    }
+
+    if (ctx->state_runtime.alarm.water_pump_retry_count >= 3U) {
+        ESP_LOGW(TAG, "H05 replenish ignored: retry limit reached=%u",
+                 (unsigned)ctx->state_runtime.alarm.water_pump_retry_count);
+        return;
+    }
+
+    if (ctr_cmd_action(CTRL_ACT_POWER, NULL)) {
+        ctx->state_runtime.alarm.water_pump_replenishing = true;
+        ctx->state_runtime.alarm.water_pump_retry_tick = ctx->timer.tick;
+        ESP_LOGI(TAG, "H05 start replenish attempt=%u",
+                 (unsigned)(ctx->state_runtime.alarm.water_pump_retry_count + 1U));
+    } else {
+        ESP_LOGW(TAG, "H05 replenish command rejected");
+    }
+}
+
 void alarm_check(app_ctx_t *ctx)
 {
     alarm_notice_t notice;
@@ -673,6 +706,23 @@ void alarm_check(app_ctx_t *ctx)
     ctx->state_runtime.alarm.suppressed_error_mask &= ctx->ms.error_code;
 
     effective_error_code = alarm_effective_error_code(ctx);
+#if APP_TEST_DISABLE_LOCAL_ALARM
+    effective_error_code = 0U;
+#endif
+    if (ctx->core.state == ST_DETECTION) {
+        /* Detection mode still suppresses P-class reminders so the sequence
+         * is not hijacked by intentionally exercised sensors, but H-class
+         * faults must remain visible for validation. */
+        if (effective_error_code != 0U) {
+            alarm_set_fault(ctx, alarm_parse_fault(effective_error_code));
+            alarm_play_prompt_if_needed(ctx);
+            return;
+        }
+
+        alarm_clear(ctx);
+        return;
+    }
+
     if (effective_error_code != 0U) {
         alarm_set_fault(ctx, alarm_parse_fault(effective_error_code));
         alarm_play_prompt_if_needed(ctx);
@@ -700,6 +750,9 @@ app_state_t state_handle_alarm(app_ctx_t *ctx)
 
     ctx->state_runtime.alarm.suppressed_error_mask &= ctx->ms.error_code;
     effective_error_code = alarm_effective_error_code(ctx);
+#if APP_TEST_DISABLE_LOCAL_ALARM
+    effective_error_code = 0U;
+#endif
 
     if (effective_error_code == 0U) {
         alarm_clear(ctx);
@@ -715,28 +768,14 @@ app_state_t state_handle_alarm(app_ctx_t *ctx)
     }
 
     if (ctx->alarm.major == 5) {
-        if ((ctx->input.key_long & (1U << KEY_CLEAN)) != 0U) {
-            ctx->input.key_long &= ~(1U << KEY_CLEAN);
-
-            if (!ctx->state_runtime.alarm.water_pump_replenishing &&
-                ctx->state_runtime.alarm.water_pump_retry_count < 3U) {
-                if (ctr_cmd_action(CTRL_ACT_CLEAN_BREW, NULL)) {
-                    ctx->state_runtime.alarm.water_pump_replenishing = true;
-                    ctx->state_runtime.alarm.water_pump_retry_tick = ctx->timer.tick;
-                    ESP_LOGI(TAG, "H05 start replenish attempt=%u",
-                             (unsigned)(ctx->state_runtime.alarm.water_pump_retry_count + 1U));
-                } else {
-                    ESP_LOGW(TAG, "H05 replenish command rejected");
-                }
-            }
+        if ((ctx->input.key_pressed & (1U << KEY_CLEAN)) != 0U) {
+            ctx->input.key_pressed &= ~(1U << KEY_CLEAN);
+            alarm_try_start_water_pump_replenish(ctx);
         }
 
-        if ((ctx->input.key_pressed & (1U << KEY_CLEAN)) != 0U) {
-            replay_voice = alarm_current_voice(ctx);
-            ctx->input.key_pressed &= ~(1U << KEY_CLEAN);
-            if (replay_voice != VOICE_NONE) {
-                voice_manager_play_interrupt(replay_voice);
-            }
+        if ((ctx->input.key_long & (1U << KEY_CLEAN)) != 0U) {
+            ctx->input.key_long &= ~(1U << KEY_CLEAN);
+            alarm_try_start_water_pump_replenish(ctx);
         }
         return ST_ALARM;
     }

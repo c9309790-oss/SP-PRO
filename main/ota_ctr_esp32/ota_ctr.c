@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include "esp_ota_ops.h"
 #include "esp_http_client.h"
+#include "esp_attr.h"
 #include "mbedtls/md5.h"
 #include "Ymodem_esp.h"
 #include "mqtt_protocol.h"
@@ -22,6 +23,7 @@
 #include "wifi.h"
 #include "mqtt_protocol_core.h"
 #include "sp_pro_app.h"
+#include "nvs_retry.h"
 
 #define CTR_OTA_PACKAGE_HEADER_LEN 0x800U
 
@@ -30,9 +32,9 @@ typedef struct {
     uint32_t app_size;
     uint8_t reserved[CTR_OTA_PACKAGE_HEADER_LEN - 8U];
 } app_head_t;
-app_head_t app_head = {0};
+EXT_RAM_BSS_ATTR app_head_t app_head = {0};
 
-ota_info_t g_ota_info={0};
+EXT_RAM_BSS_ATTR ota_info_t g_ota_info={0};
 uint8_t g_ota_new_url_pending=0;
 
 #define NVS_CTR_OTA "ota_info"
@@ -42,7 +44,7 @@ static const char *TAG = "CTR_OTA";
 uint8_t ctr_ota_run_flag=0;
 static volatile uint8_t ctr_ota_result_ack_received = 0;
 static portMUX_TYPE ctr_ota_task_lock = portMUX_INITIALIZER_UNLOCKED;
-static ota_package_probe_result_t g_ota_package_probe = {0};
+static EXT_RAM_BSS_ATTR ota_package_probe_result_t g_ota_package_probe = {0};
 static StaticTask_t s_ctr_ota_task_tcb;
 static StackType_t s_ctr_ota_task_stack[CTR_OTA_TASK_STACK_WORDS];
 static volatile bool s_local_http_test_waiting_for_wifi = false;
@@ -78,6 +80,54 @@ static const char *ota_nvs_name_arr[] = {
     "ota_error_info",
 };
 
+typedef struct {
+    OTA_INFOIDX_TYP idx;
+    ota_info_t *info;
+    const char *str_value;
+} ota_nvs_write_ctx_t;
+
+static esp_err_t ota_write_single_param_to_nvs(nvs_handle_t nvs_handle, void *ctx)
+{
+    const ota_nvs_write_ctx_t *write_ctx = (const ota_nvs_write_ctx_t *)ctx;
+
+    if (!write_ctx || !write_ctx->info || write_ctx->idx > OTA_INFO_ERROR_INFO) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (write_ctx->idx == OTA_INFO_STA) {
+        return nvs_set_u8(nvs_handle, ota_nvs_name_arr[write_ctx->idx], write_ctx->info->ota_sta);
+    }
+
+    if (write_ctx->idx == OTA_INFO_ERROR_INFO) {
+        return nvs_set_u8(nvs_handle, ota_nvs_name_arr[write_ctx->idx], write_ctx->info->ota_error_info);
+    }
+
+    return nvs_set_str(nvs_handle,
+                       ota_nvs_name_arr[write_ctx->idx],
+                       write_ctx->str_value ? write_ctx->str_value : "");
+}
+
+static esp_err_t ota_write_reset_context_to_nvs(nvs_handle_t nvs_handle, void *ctx)
+{
+    (void)ctx;
+
+    for (int idx = 0; idx <= OTA_INFO_ERROR_INFO; ++idx) {
+        esp_err_t err;
+
+        if (idx == OTA_INFO_STA || idx == OTA_INFO_ERROR_INFO) {
+            err = nvs_set_u8(nvs_handle, ota_nvs_name_arr[idx], 0);
+        } else {
+            err = nvs_set_str(nvs_handle, ota_nvs_name_arr[idx], "");
+        }
+
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    return ESP_OK;
+}
+
 static const char *ctr_ota_state_name(IOT_SIMPLE_OTA_STA_TYP state)
 {
     switch (state) {
@@ -102,6 +152,21 @@ static const char *ctr_ota_state_name(IOT_SIMPLE_OTA_STA_TYP state)
     default:
         return "UNKNOWN";
     }
+}
+
+static bool ctr_ota_should_delay_auto_update(void)
+{
+    int task_status = mqtt_get_task_status();
+
+    if (task_status == 257 || task_status == 1793) {
+        ESP_LOGW(TAG,
+                 "Defer auto OTA because machine is busy, taskStatus=%d appState=%d",
+                 task_status,
+                 (int)sp_pro_app_get_state());
+        return true;
+    }
+
+    return false;
 }
 
 static const char *ctr_ota_error_name(OTA_ERROR_TYPE_TYP error)
@@ -363,27 +428,40 @@ static void ctr_ota_publish_failure_result(void)
 esp_err_t ota_params_reset(void)
 {
     nvs_handle_t nvs_handle;
+    static const char *const keys[] = {
+        "ota_url",
+        "ota_md5",
+        "ota_file_name",
+        "ota_dtype",
+        "ota_stype",
+        "ota_tkid",
+        "ota_file_path",
+        "ota_autoUp",
+        "ota_msgid",
+        "ota_sta",
+        "ota_error_info",
+    };
     esp_err_t err = nvs_open(NVS_CTR_OTA, NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK) {
         return err;
     }
 
-    for(int idx=0;idx<=OTA_INFO_ERROR_INFO;idx++)
-    {
-        if(idx==OTA_INFO_STA || idx==OTA_INFO_ERROR_INFO)
-        {
-            err = nvs_set_u8(nvs_handle, ota_nvs_name_arr[idx], 0);
-        }
-        else
-        {
-            err = nvs_set_str(nvs_handle, ota_nvs_name_arr[idx], "");
-        }
-        if (err != ESP_OK) 
-        {
-            nvs_close(nvs_handle);
-            return err;
-        }
+    err = ota_write_reset_context_to_nvs(nvs_handle, NULL);
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        err = nvs_retry_rewrite_after_erasing_keys(nvs_handle,
+                                                   err,
+                                                   TAG,
+                                                   "ota reset context",
+                                                   keys,
+                                                   sizeof(keys) / sizeof(keys[0]),
+                                                   ota_write_reset_context_to_nvs,
+                                                   NULL);
     }
+    if (err != ESP_OK) {
+        nvs_close(nvs_handle);
+        return err;
+    }
+
     memset(&g_ota_info,0,sizeof(g_ota_info));
     g_ota_new_url_pending = 0;
     ctr_ota_clear_result_ack();
@@ -399,6 +477,11 @@ esp_err_t ota_params_edit(OTA_INFOIDX_TYP idx, const void *value)
 {
     ota_info_t *info = &g_ota_info;
     const char *str_value = (const char *)value;
+    ota_nvs_write_ctx_t write_ctx = {
+        .idx = idx,
+        .info = info,
+        .str_value = str_value,
+    };
     nvs_handle_t nvs_handle;
     esp_err_t err = nvs_open(NVS_CTR_OTA, NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK) {
@@ -450,17 +533,20 @@ esp_err_t ota_params_edit(OTA_INFOIDX_TYP idx, const void *value)
             break;
     }
 
-    if (idx == OTA_INFO_STA)
-    {
-        err = nvs_set_u8(nvs_handle, ota_nvs_name_arr[idx], info->ota_sta);
-    }
-    else if (idx == OTA_INFO_ERROR_INFO)
-    {
-        err = nvs_set_u8(nvs_handle, ota_nvs_name_arr[idx], info->ota_error_info);
-    }
-    else
-    {
-        err = nvs_set_str(nvs_handle, ota_nvs_name_arr[idx], str_value);
+    err = ota_write_single_param_to_nvs(nvs_handle, &write_ctx);
+
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        const char *const keys[] = {
+            ota_nvs_name_arr[idx],
+        };
+        err = nvs_retry_rewrite_after_erasing_keys(nvs_handle,
+                                                   err,
+                                                   TAG,
+                                                   "ota context field",
+                                                   keys,
+                                                   sizeof(keys) / sizeof(keys[0]),
+                                                   ota_write_single_param_to_nvs,
+                                                   &write_ctx);
     }
 
     if (err != ESP_OK) {
@@ -1551,22 +1637,27 @@ void ctr_ota_task(void *pvParameters)
 
                 if (g_ota_info.ota_auto_up[0] == '1')
                 {
-                    if (ctr_ota_is_hmi_only_bundle()) {
-                        ESP_LOGI(TAG, "HMI OTA auto confirmed by autoUpdateFlag=1, stage ESP32 image now");
-                        if (ctr_ota_stage_esp32_from_bundle() != ESP_OK) {
-                            ctr_ota_set_error(OTA_ERROR_APPLY_FAIL);
-                            ctr_ota_set_state(IOT_SIMPLE_OTA_FAIL);
-                        } else {
-                            ctr_ota_set_error(OTA_ERROR_NONE);
-                            ctr_ota_set_state(IOT_SIMPLE_OTA_SUCCESS);
-                        }
+                    if (ctr_ota_should_delay_auto_update()) {
+                        ESP_LOGI(TAG, "Auto OTA is pending, wait for machine task to finish before continue");
+                        ctr_ota_set_state(IOT_SIMPLE_OTA_WAIT_CONFIRM);
                     } else {
-                        ESP_LOGI(TAG, "OTA auto update confirmed by autoUpdateFlag=1, request controller reboot to bootloader");
-                        publish_ota_status_to_mqtt(OTA_YES_CONFIRM);
-                        if (!ctr_ota_enter_ymodem_mode())
-                        {
-                            ctr_ota_set_error(OTA_ERROR_APPLY_FAIL);
-                            ctr_ota_set_state(IOT_SIMPLE_OTA_FAIL);
+                        if (ctr_ota_is_hmi_only_bundle()) {
+                            ESP_LOGI(TAG, "HMI OTA auto confirmed by autoUpdateFlag=1, stage ESP32 image now");
+                            if (ctr_ota_stage_esp32_from_bundle() != ESP_OK) {
+                                ctr_ota_set_error(OTA_ERROR_APPLY_FAIL);
+                                ctr_ota_set_state(IOT_SIMPLE_OTA_FAIL);
+                            } else {
+                                ctr_ota_set_error(OTA_ERROR_NONE);
+                                ctr_ota_set_state(IOT_SIMPLE_OTA_SUCCESS);
+                            }
+                        } else {
+                            ESP_LOGI(TAG, "OTA auto update confirmed by autoUpdateFlag=1, request controller reboot to bootloader");
+                            publish_ota_status_to_mqtt(OTA_YES_CONFIRM);
+                            if (!ctr_ota_enter_ymodem_mode())
+                            {
+                                ctr_ota_set_error(OTA_ERROR_APPLY_FAIL);
+                                ctr_ota_set_state(IOT_SIMPLE_OTA_FAIL);
+                            }
                         }
                     }
                 }
@@ -1587,6 +1678,17 @@ void ctr_ota_task(void *pvParameters)
             {
                 if (ctr_ota_switch_to_pending_url()) {
                     break;
+                }
+
+                if (g_ota_info.ota_auto_up[0] == '1')
+                {
+                    if (ctr_ota_should_delay_auto_update()) {
+                        break;
+                    }
+
+                    ESP_LOGI(TAG, "Auto OTA resume now because machine task finished");
+                    publish_ota_status_to_mqtt(OTA_YES_CONFIRM);
+                    ota_params_edit(OTA_INFO_AUTOUP, "9");
                 }
 
                 if (g_ota_info.ota_auto_up[0] == '9')

@@ -7,6 +7,8 @@
 #include "esp_log.h"
 
 static const char *TAG = "state_ready";
+#define READY_CLEAR_BEAN_ENTRY_HOLD_TICKS STAY_TICKS(2000)
+
 extern const sp_pro_param_map_t g_param_map[];
 extern FLASH_FACTORY_DATA factory_data;
 
@@ -69,10 +71,7 @@ static bool ready_key_blocked_by_notice(const app_ctx_t *ctx, uint8_t key)
                key == KEY_CLEAN;
 
     case WARN_BEAN_MISS:
-        return key == KEY_ESPRESSO ||
-               key == KEY_AMERICANO ||
-               key == KEY_COLD_BREW ||
-               key == KEY_GRIND;
+        return key == KEY_GRIND;
 
     default:
         return false;
@@ -97,6 +96,45 @@ static bool ready_consume_blocked_key(app_ctx_t *ctx, uint8_t key, bool is_long_
     if (voice != VOICE_NONE) {
         voice_manager_play_interrupt(voice);
     }
+    return true;
+}
+
+static bool ready_maybe_enter_clear_bean(app_ctx_t *ctx)
+{
+    if (!ctx) {
+        return false;
+    }
+
+    if (ctx->ms.beanbox_in_place == 1U &&
+        ctx->state_runtime.clear_bean.post_clean_notice_pending) {
+        ctx->state_runtime.clear_bean.post_clean_notice_pending = false;
+        ESP_LOGI(TAG, "Clear-bean post notice cleared after hopper relock");
+    }
+
+    if (!clear_bean_should_enter(ctx)) {
+        ctx->state_runtime.ready.clear_bean_unlock_tick = 0U;
+        return false;
+    }
+
+    if (ctx->state_runtime.ready.clear_bean_unlock_tick == 0U) {
+        ctx->state_runtime.ready.clear_bean_unlock_tick = ctx->timer.tick;
+        ESP_LOGI(TAG,
+                 "Clear-bean unlock hold start tick=%lu hopper=%u",
+                 (unsigned long)ctx->timer.tick,
+                 (unsigned)ctx->ms.beanbox_in_place);
+        return false;
+    }
+
+    if ((ctx->timer.tick - ctx->state_runtime.ready.clear_bean_unlock_tick) <
+        READY_CLEAR_BEAN_ENTRY_HOLD_TICKS) {
+        return false;
+    }
+
+    ctx->state_runtime.ready.clear_bean_unlock_tick = 0U;
+    ESP_LOGI(TAG,
+             "Clear-bean unlock hold satisfied tick=%lu hopper=%u -> ST_CLEAR_BEAN",
+             (unsigned long)ctx->timer.tick,
+             (unsigned)ctx->ms.beanbox_in_place);
     return true;
 }
 
@@ -455,7 +493,12 @@ app_state_t state_handle_ready(app_ctx_t *ctx)
 {
     app_state_t next_state;
 
-    if (clear_bean_should_enter(ctx)) {
+    if (ctx->state_runtime.clear_bean.post_clean_notice_pending) {
+        ready_clear_pending_steam_clicks(ctx);
+        return ST_READY;
+    }
+
+    if (ready_maybe_enter_clear_bean(ctx)) {
         ready_clear_pending_steam_clicks(ctx);
         return ST_CLEAR_BEAN;
     }

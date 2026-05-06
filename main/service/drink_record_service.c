@@ -11,11 +11,11 @@
 #define DRINK_RECORD_RESULT_SUCCESS          0
 #define DRINK_RECORD_RESULT_CANCEL           1
 #define DRINK_RECORD_MATERIAL_BEAN           0
-#define DRINK_RECORD_MATERIAL_COFFEE_POWDER  1
 #define DRINK_RECORD_LOCATION_DEFAULT        1
 #define DRINK_RECORD_IDLE_MS              3000LL
 
 static const char *TAG = "DRINK_RECORD";
+extern MACHINE_STATUS machine_status;
 
 typedef struct {
     bool active;
@@ -27,6 +27,7 @@ typedef struct {
     uint8_t drink_id;
     int64_t start_ms;
     int64_t idle_since_ms;
+    float start_powder_weight;
     formula_info_t formula;
 } drink_record_session_t;
 
@@ -84,24 +85,6 @@ static void drink_record_reset_session(void)
     memset(&s_session, 0, sizeof(s_session));
 }
 
-static float drink_record_bean_weight_from_grind_range(uint8_t grind_range)
-{
-    switch (grind_range) {
-    case 1:
-        return 6.0f;
-    case 2:
-        return 7.25f;
-    case 3:
-        return 8.5f;
-    case 4:
-        return 9.25f;
-    case 5:
-        return 11.0f;
-    default:
-        return 0.0f;
-    }
-}
-
 static void drink_record_add_material(drink_record_t *record,
                                       uint8_t type,
                                       uint8_t location,
@@ -121,26 +104,22 @@ static void drink_record_add_material(drink_record_t *record,
 
 static void drink_record_fill_materials(const formula_info_t *formula, drink_record_t *record)
 {
-    float bean_weight;
+    float actual_powder_weight;
 
     if (!formula || !record) {
         return;
     }
 
-    bean_weight = drink_record_bean_weight_from_grind_range(formula->grind_range);
-    if (bean_weight > 0.0f) {
+    actual_powder_weight = machine_status.powder_weight - s_session.start_powder_weight;
+    if (actual_powder_weight < 0.0f) {
+        actual_powder_weight = 0.0f;
+    }
+
+    if (actual_powder_weight > 0.0f) {
         drink_record_add_material(record,
                                   DRINK_RECORD_MATERIAL_BEAN,
                                   DRINK_RECORD_LOCATION_DEFAULT,
-                                  bean_weight);
-        return;
-    }
-
-    if (formula->grind_weight > 0U) {
-        drink_record_add_material(record,
-                                  DRINK_RECORD_MATERIAL_COFFEE_POWDER,
-                                  DRINK_RECORD_LOCATION_DEFAULT,
-                                  (float)formula->grind_weight);
+                                  actual_powder_weight);
     }
 }
 
@@ -162,7 +141,7 @@ static void drink_record_build_local_formula(app_state_t state,
     formula->drink_id = drink_id;
     snprintf(formula->drink_name, sizeof(formula->drink_name), "%s", drink_name);
     snprintf(formula->formula_name, sizeof(formula->formula_name), "%s", drink_name);
-    formula->grind_weight = (uint16_t)(settings->grind_w + 0.5f);
+    formula->grind_weight = settings->grind_w;
 
     switch (state) {
     case ST_MASTER:
@@ -259,15 +238,17 @@ static void drink_record_start_session(bool local_session,
     s_session.remote_action = remote_action;
     s_session.drink_id = formula->drink_id;
     s_session.start_ms = drink_record_now_ms();
+    s_session.start_powder_weight = machine_status.powder_weight;
     s_session.formula = *formula;
 
     ESP_LOGI(TAG,
-             "drink record session start local=%d state=%d action=%d drinkId=%u formula=%s",
+             "drink record session start local=%d state=%d action=%d drinkId=%u formula=%s startPowder=%.1f",
              local_session ? 1 : 0,
              (int)local_state,
              (int)remote_action,
              (unsigned int)s_session.drink_id,
-             s_session.formula.formula_name);
+             s_session.formula.formula_name,
+             (double)s_session.start_powder_weight);
 }
 
 static bool drink_record_is_remote_action_active(control_action_t action, const MACHINE_STATUS *status)

@@ -1,5 +1,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include <ctype.h>
@@ -18,6 +19,7 @@
 #include "mqtt_protocol.h"
 #include "nvs.h"
 #include "esp_err.h"
+#include "nvs_retry.h"
 #include "ram_diag.h"
 
 #define TAG "uart_ctr"
@@ -28,8 +30,8 @@
 #define CTR_POLL_PERIOD_MS    200
 #define CTR_PARSE_BUF_LEN     CTR_PKT_MAX_LEN
 #define CTR_ECHO_WINDOW_MS    500
-#define CTR_UART_RX_TASK_STACK_SIZE_DEFAULT 4096
-#define CTR_UART_RX_TASK_STACK_SIZE_TEST    4096
+#define CTR_UART_RX_TASK_STACK_SIZE_DEFAULT 8192
+#define CTR_UART_RX_TASK_STACK_SIZE_TEST    8192
 #define CTR_UART_RX_TASK_STACK_SIZE         CTR_UART_RX_TASK_STACK_SIZE_TEST
 #define CTR_FACTORY_NVS_NAMESPACE "ctr_factory"
 #define CTR_FACTORY_NVS_KEY       "factory_v1"
@@ -45,7 +47,7 @@ static QueueHandle_t ctr_uart_event_queue;
 static SemaphoreHandle_t ctr_tx_mutex;
 static StaticSemaphore_t ctr_tx_mutex_buffer;
 static TimerHandle_t ctr_poll_timer = NULL;
-static char ctr_last_tx_payload[CTR_PKT_MAX_LEN];
+static EXT_RAM_BSS_ATTR char ctr_last_tx_payload[CTR_PKT_MAX_LEN];
 static TickType_t ctr_last_tx_tick = 0;
 static volatile TickType_t ctr_last_status_tick = 0;
 static ctr_version_update_handler_t ctr_version_update_handler = NULL;
@@ -60,6 +62,17 @@ typedef struct {
     uint16_t reserved;
     FLASH_FACTORY_DATA data;
 } ctr_factory_blob_t;
+
+static esp_err_t ctr_factory_blob_write_to_nvs(nvs_handle_t nvs_handle, void *ctx)
+{
+    const ctr_factory_blob_t *blob = (const ctr_factory_blob_t *)ctx;
+
+    if (!blob) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return nvs_set_blob(nvs_handle, CTR_FACTORY_NVS_KEY, blob, sizeof(*blob));
+}
 
 static bool ctr_factory_float_is_valid(float value);
 
@@ -203,6 +216,20 @@ static bool ctr_factory_data_save_to_nvs(void)
     if (err == ESP_OK) {
         err = nvs_commit(nvs_handle);
     }
+
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        static const char *const keys[] = {
+            CTR_FACTORY_NVS_KEY,
+        };
+        err = nvs_retry_rewrite_after_erasing_keys(nvs_handle,
+                                                   err,
+                                                   TAG,
+                                                   "factory data",
+                                                   keys,
+                                                   sizeof(keys) / sizeof(keys[0]),
+                                                   ctr_factory_blob_write_to_nvs,
+                                                   &blob);
+    }
     nvs_close(nvs_handle);
 
     if (err != ESP_OK) {
@@ -297,13 +324,14 @@ bool ctr_factory_data_is_valid(const FLASH_FACTORY_DATA *data, char *reason, siz
     }
     if (!ctr_factory_string_is_valid(data->model_name,
                                      sizeof(data->model_name),
-                                     true,
+                                     false,
                                      reason,
                                      reason_size,
                                      "invalid model")) {
         return false;
     }
-    if (data->mains_frequency != 50 && data->mains_frequency != 60) {
+    if (data->mains_frequency < FACTORY_MAINS_PROFILE_220V_50HZ_CCC ||
+        data->mains_frequency > FACTORY_MAINS_PROFILE_120V_60HZ_UL) {
         ctr_factory_set_reason(reason, reason_size, "invalid mains_frequency");
         return false;
     }
@@ -375,6 +403,52 @@ static bool ctr_parse_float_field(const char *text, float *out)
     return true;
 }
 
+static bool ctr_parse_optional_int_field(const char *text,
+                                         int min_value,
+                                         int max_value,
+                                         int *out,
+                                         const char *field_name)
+{
+    int parsed_value;
+
+    if (!text || text[0] == '\0') {
+        return true;
+    }
+
+    if (!ctr_parse_int_field(text, min_value, max_value, &parsed_value)) {
+        ESP_LOGW(TAG,
+                 "Ignore invalid optional factory int field=%s raw=%s",
+                 field_name ? field_name : "?",
+                 text);
+        return true;
+    }
+
+    *out = parsed_value;
+    return true;
+}
+
+static bool ctr_parse_optional_float_field(const char *text,
+                                           float *out,
+                                           const char *field_name)
+{
+    float parsed_value;
+
+    if (!text || text[0] == '\0') {
+        return true;
+    }
+
+    if (!ctr_parse_float_field(text, &parsed_value)) {
+        ESP_LOGW(TAG,
+                 "Ignore invalid optional factory float field=%s raw=%s",
+                 field_name ? field_name : "?",
+                 text);
+        return true;
+    }
+
+    *out = parsed_value;
+    return true;
+}
+
 static bool ctr_split_factory_fields(char *payload, char *fields[], size_t field_count)
 {
     char *cursor = payload;
@@ -415,12 +489,68 @@ static bool parse_factory_csv_strict(char *factory_payload, FLASH_FACTORY_DATA *
     }
 
     memset(fields, 0, sizeof(fields));
-    memset(&parsed, 0, sizeof(parsed));
+    parsed = factory_data;
     reason[0] = '\0';
+
+    if (!ctr_factory_string_is_valid(parsed.sn_num,
+                                     sizeof(parsed.sn_num),
+                                     false,
+                                     NULL,
+                                     0U,
+                                     "invalid sn")) {
+        memset(parsed.sn_num, 0, sizeof(parsed.sn_num));
+    }
+    if (!ctr_factory_string_is_valid(parsed.model_name,
+                                     sizeof(parsed.model_name),
+                                     false,
+                                     NULL,
+                                     0U,
+                                     "invalid model")) {
+        memset(parsed.model_name, 0, sizeof(parsed.model_name));
+    }
+    if (parsed.mains_frequency < FACTORY_MAINS_PROFILE_220V_50HZ_CCC ||
+        parsed.mains_frequency > FACTORY_MAINS_PROFILE_120V_60HZ_UL) {
+        parsed.mains_frequency = FACTORY_MAINS_PROFILE_220V_50HZ_CCC;
+    }
+    if (!ctr_factory_float_is_valid(parsed.powder_k_value)) {
+        parsed.powder_k_value = 0.0f;
+    }
+    if (!ctr_factory_float_is_valid(parsed.powder_b_value)) {
+        parsed.powder_b_value = 0.0f;
+    }
+    if (!ctr_factory_float_is_valid(parsed.liquid_k_value)) {
+        parsed.liquid_k_value = 0.0f;
+    }
+    if (!ctr_factory_float_is_valid(parsed.liquid_b_value)) {
+        parsed.liquid_b_value = 0.0f;
+    }
+    if (!ctr_factory_float_is_valid(parsed.flowmeter_coff) || parsed.flowmeter_coff <= 0.0f) {
+        parsed.flowmeter_coff = CTR_FACTORY_FLOWMETER_DEFAULT;
+    }
+    if (parsed.powder_weight_coff < 0 || parsed.powder_weight_coff > CTR_FACTORY_MAX_INT_VALUE) {
+        parsed.powder_weight_coff = 0;
+    }
+    if (parsed.first_powered_on < 0 || parsed.first_powered_on > 1) {
+        parsed.first_powered_on = 0;
+    }
+    if (parsed.water_supply_mode < 0 || parsed.water_supply_mode > 1) {
+        parsed.water_supply_mode = 0;
+    }
+    if (parsed.reserved_2 < 0 || parsed.reserved_2 > CTR_FACTORY_MAX_INT_VALUE) {
+        parsed.reserved_2 = 0;
+    }
+    if (parsed.reserved_3 < 0 || parsed.reserved_3 > CTR_FACTORY_MAX_INT_VALUE) {
+        parsed.reserved_3 = 0;
+    }
+    if (parsed.reserved_4 < 0 || parsed.reserved_4 > CTR_FACTORY_MAX_INT_VALUE) {
+        parsed.reserved_4 = 0;
+    }
 
     if (strncmp(factory_payload, "FACTORY=", strlen("FACTORY=")) == 0) {
         factory_payload += strlen("FACTORY=");
     }
+
+    ESP_LOGI(TAG, "Factory payload raw: %s", factory_payload);
 
     if (!ctr_split_factory_fields(factory_payload, fields, CTR_FACTORY_FIELD_COUNT)) {
         ESP_LOGW(TAG, "Reject factory payload: field count mismatch");
@@ -428,36 +558,37 @@ static bool parse_factory_csv_strict(char *factory_payload, FLASH_FACTORY_DATA *
     }
 
     for (size_t i = 0; i < CTR_FACTORY_FIELD_COUNT; i++) {
-        if (i == 0U) {
-            continue;
-        }
-        if (!fields[i] || fields[i][0] == '\0') {
-            ESP_LOGW(TAG, "Reject factory payload: empty field index=%u", (unsigned)i);
-            return false;
-        }
+        ESP_LOGI(TAG,
+                 "Factory field[%u]=%s",
+                 (unsigned)i,
+                 (fields[i] && fields[i][0] != '\0') ? fields[i] : "<empty>");
     }
 
-    if (strlen(fields[0]) >= sizeof(parsed.sn_num) ||
-        strlen(fields[1]) >= sizeof(parsed.model_name)) {
+    if ((fields[0] && strlen(fields[0]) >= sizeof(parsed.sn_num)) ||
+        (fields[1] && strlen(fields[1]) >= sizeof(parsed.model_name))) {
         ESP_LOGW(TAG, "Reject factory payload: sn/model too long");
         return false;
     }
 
-    snprintf(parsed.sn_num, sizeof(parsed.sn_num), "%s", fields[0]);
-    snprintf(parsed.model_name, sizeof(parsed.model_name), "%s", fields[1]);
+    if (fields[0] && fields[0][0] != '\0') {
+        snprintf(parsed.sn_num, sizeof(parsed.sn_num), "%s", fields[0]);
+    }
+    if (fields[1] && fields[1][0] != '\0') {
+        snprintf(parsed.model_name, sizeof(parsed.model_name), "%s", fields[1]);
+    }
 
-    if (!ctr_parse_int_field(fields[2], 1, 400, &parsed.mains_frequency) ||
-        !ctr_parse_float_field(fields[3], &parsed.powder_k_value) ||
-        !ctr_parse_float_field(fields[4], &parsed.powder_b_value) ||
-        !ctr_parse_float_field(fields[5], &parsed.liquid_k_value) ||
-        !ctr_parse_float_field(fields[6], &parsed.liquid_b_value) ||
-        !ctr_parse_float_field(fields[7], &parsed.flowmeter_coff) ||
-        !ctr_parse_int_field(fields[8], 0, CTR_FACTORY_MAX_INT_VALUE, &parsed.powder_weight_coff) ||
+    if (!ctr_parse_optional_int_field(fields[2], 0, 5, &parsed.mains_frequency, "mains_frequency") ||
+        !ctr_parse_optional_float_field(fields[3], &parsed.powder_k_value, "powder_k_value") ||
+        !ctr_parse_optional_float_field(fields[4], &parsed.powder_b_value, "powder_b_value") ||
+        !ctr_parse_optional_float_field(fields[5], &parsed.liquid_k_value, "liquid_k_value") ||
+        !ctr_parse_optional_float_field(fields[6], &parsed.liquid_b_value, "liquid_b_value") ||
+        !ctr_parse_optional_float_field(fields[7], &parsed.flowmeter_coff, "flowmeter_coff") ||
+        !ctr_parse_optional_int_field(fields[8], 0, CTR_FACTORY_MAX_INT_VALUE, &parsed.powder_weight_coff, "powder_weight_coff") ||
         !ctr_parse_int_field(fields[9], 0, 1, &parsed.first_powered_on) ||
-        !ctr_parse_int_field(fields[10], 0, 1, &parsed.water_supply_mode) ||
-        !ctr_parse_int_field(fields[11], 0, CTR_FACTORY_MAX_INT_VALUE, &parsed.reserved_2) ||
-        !ctr_parse_int_field(fields[12], 0, CTR_FACTORY_MAX_INT_VALUE, &parsed.reserved_3) ||
-        !ctr_parse_int_field(fields[13], 0, CTR_FACTORY_MAX_INT_VALUE, &parsed.reserved_4)) {
+        !ctr_parse_optional_int_field(fields[10], 0, 1, &parsed.water_supply_mode, "water_supply_mode") ||
+        !ctr_parse_optional_int_field(fields[11], 0, CTR_FACTORY_MAX_INT_VALUE, &parsed.reserved_2, "reserved_2") ||
+        !ctr_parse_optional_int_field(fields[12], 0, CTR_FACTORY_MAX_INT_VALUE, &parsed.reserved_3, "reserved_3") ||
+        !ctr_parse_optional_int_field(fields[13], 0, CTR_FACTORY_MAX_INT_VALUE, &parsed.reserved_4, "reserved_4")) {
         ESP_LOGW(TAG, "Reject factory payload: field parse failed");
         return false;
     }
@@ -627,11 +758,12 @@ static void ctr_poll_timer_cb(TimerHandle_t timer_handle)
     ctr_send_cmd(CTR_CMD_READ_ALL, "123@READ@ALL#123");
 }
 
-static bool ctr_sync_version_info_from_status(void)
+static bool ctr_sync_version_info_from_status(bool first_status_sync)
 {
     const char *fw_version = (const char *)machine_status.ucFwVersion;
     char version[sizeof(g_device_version.current_ctr_fw_version)] = {0};
     size_t version_len;
+    bool version_changed;
 
     if (!fw_version) {
         return false;
@@ -644,17 +776,29 @@ static bool ctr_sync_version_info_from_status(void)
 
     snprintf(version, sizeof(version), "%.*s", (int)version_len, fw_version);
 
-    if (strcmp(g_device_version.current_ctr_fw_version, version) == 0) {
+    version_changed = strcmp(g_device_version.current_ctr_fw_version, version) != 0;
+    if (!version_changed && !first_status_sync) {
         return false;
     }
 
-    update_ctr_version(version);
-    ESP_LOGI(TAG, "Synced CTR version: version=%s", g_device_version.current_ctr_fw_version);
+    if (version_changed) {
+        update_ctr_version(version);
+        ESP_LOGI(TAG, "Synced CTR version: version=%s", g_device_version.current_ctr_fw_version);
+    } else {
+        ESP_LOGI(TAG, "CTR first status synced with existing version=%s", version);
+    }
+
+    if (ctr_version_update_handler != NULL) {
+        ctr_version_update_handler(version);
+    }
+
     return true;
 }
 
 static void ctr_handle_status(const char *payload)
 {
+    bool first_status_sync;
+
     if (!parse_machine_status(payload)) {
         ESP_LOGW(TAG, "Failed to parse machine status payload");
         return;
@@ -672,8 +816,9 @@ static void ctr_handle_status(const char *payload)
             //  machine_status.brew_current_temp,
             //  machine_status.liquid_weight);
 
-    ctr_sync_version_info_from_status();
+    first_status_sync = (ctr_last_status_tick == 0);
     ctr_last_status_tick = xTaskGetTickCount();
+    ctr_sync_version_info_from_status(first_status_sync);
 
     sp_pro_update_machine_status(&machine_status);
 }

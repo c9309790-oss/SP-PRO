@@ -24,6 +24,13 @@ bool sp_pro_app_is_off(void);
 void sp_pro_app_enter_on(void);
 void sp_pro_app_enter_ready(void);
 void sp_pro_app_enter_off(void);
+void sp_pro_app_request_remote_power_on(void);
+void sp_pro_app_request_remote_power_off(void);
+void sp_pro_app_enter_clean_brew(void);
+void sp_pro_app_enter_maint_brew(void);
+void sp_pro_app_enter_maint_des(void);
+void sp_pro_app_enter_maint_steam(void);
+void sp_pro_app_enter_maint_drain(void);
 bool sp_pro_app_toggle_child_lock(void);
 bool sp_pro_app_is_child_lock_enabled(void);
 app_state_t sp_pro_app_get_state(void);
@@ -31,6 +38,7 @@ int sp_pro_app_get_maintain_notice_status(maint_type_t type);
 bool sp_pro_app_state_requires_brew_handle(app_state_t state);
 bool sp_pro_app_formula_requires_brew_handle(const formula_info_t *formula);
 bool sp_pro_app_is_brew_handle_in_place(void);
+bool sp_pro_app_is_grind_handle_in_place(void);
 bool sp_pro_app_start_remote_drink(const formula_info_t *formula);
 
 #endif /* SP_PRO_APP_CTRL_H */

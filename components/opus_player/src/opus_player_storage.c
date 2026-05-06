@@ -5,6 +5,7 @@
 
 #include "opus_player_storage.h"
 #include "opus_player_common.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_spiffs.h"
@@ -27,7 +28,7 @@ static const char *TAG = "opus_storage";
 #define MAX_CACHED_FILES      MAX_OPUS_FILES
 
 // 存储状态
-static struct {
+static EXT_RAM_BSS_ATTR struct {
     bool initialized;
     struct {
         char name[MAX_FILENAME_LEN];

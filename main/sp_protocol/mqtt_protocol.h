@@ -1,9 +1,10 @@
-#ifndef IOT_MQTT_PROTOCOL_H
+﻿#ifndef IOT_MQTT_PROTOCOL_H
 #define IOT_MQTT_PROTOCOL_H
 
 #include <stdbool.h>
 #include <stdint.h>
 #include "service_domain_types.h"
+#include "controller_status_types.h"
 
 /* Test-only MQTT internal command gate. Set to 0 for production builds. */
 #ifndef MQTT_INTERNAL_TEST_ENABLE
@@ -14,8 +15,8 @@
 typedef enum {
     CMD_TYPE_OTHER  = 2,
     CMD_TYPE_STATUS = 3,
-    CMD_TYPE_GRIND  = 7,
     CMD_TYPE_MASTER = 8,
+    CMD_TYPE_GRIND  = 9,
 } cmd_type_t;
 
 /* Command codes are defined as strings in the protocol. */
@@ -69,7 +70,7 @@ typedef enum {
 
 /* Shared payload types. */
 typedef struct {
-    char name[32];
+    char name[40];
     char status[16];
 } sensor_info_t;
 
@@ -139,7 +140,7 @@ typedef enum {
      MQTT_DEVICE_STATUS_SECTION_CLEAN_RESULT | MQTT_DEVICE_STATUS_SECTION_STATISTICS)
 
 typedef struct {
-    char name[32];
+    char name[40];
     int status;
 } ack_sensor_info_t;
 
@@ -202,9 +203,10 @@ void publish_ctr_ota_check_status_to_mqtt(void);
 void publish_device_status_to_mqtt(const device_status_message_t *status);
 void publish_formula_overall_ack_to_mqtt(const char *msg_id, int ack_code, const char *msg);
 void publish_drink_ack_to_mqtt(const char *msg_id, int ack_code, const ack_sensor_info_t *sensors, int sensors_count, const char *msg);
-void publish_cleaning_ack_to_mqtt(const char *msg_id, int ack_code, const char *msg);
+void publish_cleaning_ack_to_mqtt(const char *msg_id, int ack_code, const int *results, int results_count, const char *msg);
 void publish_version_info_to_mqtt(version_info_t *ver);
 void publish_drink_record_to_mqtt(drink_record_t *rec);
+void publish_extraction_curve_records_to_mqtt(extraction_curve_record_t *records, int record_count, bool curve_update);
 void publish_event_record_to_mqtt(event_record_t *rec);
 void publish_log_info_to_mqtt(const char *log_detail);
 void publish_resource_request_to_mqtt(int resource_type, const char *language);
@@ -222,13 +224,21 @@ void mqtt_register_resource_retry_handler(mqtt_resource_retry_handler_t handler)
 void mqtt_report_device_status(void);
 void mqtt_report_device_status_brief(void);
 void mqtt_report_device_status_sections(uint32_t section_mask, const char *reason);
+bool mqtt_request_immediate_device_status_sections_report(uint32_t section_mask, const char *reason);
+bool mqtt_schedule_device_status_sections_report(uint32_t section_mask, const char *reason, uint32_t delay_ms);
+void mqtt_set_next_formula_overall_report_msg_id(const char *msg_id);
 const setting_info_t *mqtt_get_runtime_setting(void);
 int mqtt_get_task_status(void);
 void mqtt_sync_runtime_setting_from_device(void);
 void mqtt_normalize_runtime_setting(void);
+bool mqtt_save_runtime_setting(void);
 void mqtt_set_formula_force_update_pending(bool pending);
 bool mqtt_is_formula_force_update_pending(void);
 void mqtt_restore_local_defaults(void);
+void mqtt_track_remote_controller_completion(const char *msg_id, int setting_type);
+void mqtt_clear_remote_controller_completion(int setting_type);
+void mqtt_notify_remote_controller_complete(int setting_type, bool success);
+void mqtt_handle_remote_maintenance_machine_status(const MACHINE_STATUS *status);
 void mqtt_mark_clean_result_incomplete(int cleaning_mode);
 void mqtt_notify_clean_result_complete(int cleaning_mode);
 

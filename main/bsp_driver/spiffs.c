@@ -1,16 +1,20 @@
 ﻿#include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include "esp_attr.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
 #include "spiffs.h"
 #include "nvs_flash.h"
+#include "nvs_retry.h"
 #include <time.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <esp_system.h>
 #include "circular_buff.h"
+
+static EXT_RAM_BSS_ATTR char flash_log_message[1024] = {0};
 
 #ifdef KLM_FLASH_LOG_ENABLE
 #define MAX_LOG_FILE_SIZE 1024 * 60  // 60 KB
@@ -23,11 +27,26 @@
 static const char *TAG = "spiffs";
 static FILE* log_file = NULL;
 static unsigned long log_file_size=0,log_file_backup_size=0;
-static char flash_log_circular_buff[FLASH_LOG_RING_BUF_SIZE]={0};
-static char flash_log_data_buff[FLASH_LOG_BUF_SIZE]={0};
+static EXT_RAM_BSS_ATTR char flash_log_circular_buff[FLASH_LOG_RING_BUF_SIZE]={0};
+static EXT_RAM_BSS_ATTR char flash_log_data_buff[FLASH_LOG_BUF_SIZE]={0};
 static CircularBuffer flash_log_ring_buf;
 static void flash_log_task(void *pvParameters);
 static void check_log_file_size();
+
+typedef struct {
+    const char *value;
+} spiffs_nvs_save_ctx_t;
+
+static esp_err_t spiffs_write_on_off_to_nvs(nvs_handle_t nvs_handle, void *ctx)
+{
+    const spiffs_nvs_save_ctx_t *save_ctx = (const spiffs_nvs_save_ctx_t *)ctx;
+
+    if (!save_ctx || !save_ctx->value) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return nvs_set_str(nvs_handle, "spiffs_on_off", save_ctx->value);
+}
 
 static void flash_log_task(void *pvParameters) {
     int len;
@@ -172,25 +191,38 @@ void read_spiffs_on_off_from_nvs(char *spiffs_on_off) {
 
 void save_spiffs_on_off_to_nvs(char *spiffs_on_off) {
     nvs_handle_t nvs_handle;
+    spiffs_nvs_save_ctx_t save_ctx = {
+        .value = spiffs_on_off,
+    };
     esp_err_t err = nvs_open("spiffs_config", NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Error (%s) opening NVS handle", esp_err_to_name(err));
         return;
     }
 
-    err = nvs_set_str(nvs_handle, "spiffs_on_off", spiffs_on_off);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error (%s) setting spiffs name in NVS", esp_err_to_name(err));
-        nvs_close(nvs_handle);
-        return;
+    err = spiffs_write_on_off_to_nvs(nvs_handle, &save_ctx);
+
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
     }
 
-    err = nvs_commit(nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error (%s) committing changes to NVS", esp_err_to_name(err));
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        static const char *const keys[] = { "spiffs_on_off" };
+        err = nvs_retry_rewrite_after_erasing_keys(nvs_handle,
+                                                   err,
+                                                   TAG,
+                                                   "spiffs on_off",
+                                                   keys,
+                                                   sizeof(keys) / sizeof(keys[0]),
+                                                   spiffs_write_on_off_to_nvs,
+                                                   &save_ctx);
     }
 
     nvs_close(nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error (%s) saving spiffs on_off to NVS", esp_err_to_name(err));
+        return;
+    }
     ESP_LOGI(TAG, "spiffs on_off saved to NVS %s", spiffs_on_off);
 }
 
@@ -304,15 +336,14 @@ void init_spiffs(void)
 int custom_log_write(const char* format, va_list args)
 {
     // 先格式化日志内容到本地缓冲区
-    static char log_message[1024];  // 复用静态缓冲区，避免频繁申请内存
     int len=0;
-    len=vsnprintf(log_message, sizeof(log_message), format, args);
+    len=vsnprintf(flash_log_message, sizeof(flash_log_message), format, args);
 
 #ifdef KLM_FLASH_LOG_ENABLE
     if (spiffs_on_off_flag) {
         // 将日志写入 SPIFFS 缓冲区
         if (log_file != NULL && len>0) {
-            circular_buffer_write(&flash_log_ring_buf, log_message, len);
+            circular_buffer_write(&flash_log_ring_buf, flash_log_message, len);
         }
     }
 #endif

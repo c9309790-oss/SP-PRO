@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "nvs_retry.h"
 #include "mqtt_protocol.h"
 #include "mqtt_protocol_codec.h"
 #include "sp_pro_app_ctrl.h"
@@ -22,12 +23,53 @@
 #define FORMULA_STORE_MAX_FORMULA_COUNT  64
 #define FORMULA_LABEL_AI                 "AI"
 #define FORMULA_LABEL_DEFAULT            "DEFAULT"
-#define FORMULA_STORE_DEFAULT_LABEL_ID   1U
+#define FORMULA_STORE_DEFAULT_LABEL_ID   (-1)
 
 #define RECORD_ID_ESPRESSO_DEFAULT       1001U
 #define RECORD_ID_AMERICANO_DEFAULT      1002U
 #define RECORD_ID_COLD_BREW_DEFAULT      1003U
 #define RECORD_ID_HOT_WATER_DEFAULT      1005U
+
+typedef struct {
+    const char *payload;
+    size_t len;
+    int version;
+    bool force_update;
+    uint32_t crc32;
+} formula_store_save_ctx_t;
+
+static esp_err_t formula_store_write_payload_to_nvs_retry(nvs_handle_t nvs_handle, void *ctx)
+{
+    const formula_store_save_ctx_t *save_ctx = (const formula_store_save_ctx_t *)ctx;
+    esp_err_t err;
+
+    if (!save_ctx || !save_ctx->payload) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = nvs_set_i32(nvs_handle, FORMULA_STORE_KEY_VERSION, save_ctx->version);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(nvs_handle, FORMULA_STORE_KEY_FORCE_UPD, save_ctx->force_update ? 1U : 0U);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_blob(nvs_handle, FORMULA_STORE_KEY_PAYLOAD, save_ctx->payload, save_ctx->len);
+    }
+    if (err == ESP_OK) {
+        err = nvs_set_u32(nvs_handle, FORMULA_STORE_KEY_PAYLOAD_CRC, save_ctx->crc32);
+    }
+    return err;
+}
+
+static esp_err_t formula_store_write_force_update_to_nvs(nvs_handle_t nvs_handle, void *ctx)
+{
+    const bool *force_update = (const bool *)ctx;
+
+    if (!force_update) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return nvs_set_u8(nvs_handle, FORMULA_STORE_KEY_FORCE_UPD, *force_update ? 1U : 0U);
+}
 #define RECORD_ID_GRIND_DEFAULT          1006U
 #define RECORD_ID_PLAYER_DEEP_DEFAULT    1U
 #define RECORD_ID_PLAYER_MID_DEFAULT     2U
@@ -59,10 +101,10 @@ typedef struct {
     const char *support_mode;
     uint8_t drink_id;
     const char *drink_name;
-    uint8_t label_id;
+    int32_t label_id;
     const char *label;
     uint8_t grind_range;
-    uint16_t grind_weight;
+    float grind_weight;
     uint16_t preset_temperature;
     uint16_t preset_liquid_weight;
     uint16_t water_temperature;
@@ -297,14 +339,13 @@ static bool formula_store_is_valid_drink_id(uint8_t drink_id)
     }
 }
 
-static bool formula_store_requires_ai_label_id(const formula_info_t *formula)
+static bool formula_store_label_equals(const char *label, const char *expected)
 {
-    if (!formula) {
+    if (!label || !expected) {
         return false;
     }
 
-    return (strcmp(formula->label, FORMULA_LABEL_AI) == 0) ||
-           (strcmp(formula->label, FORMULA_LABEL_DEFAULT) == 0);
+    return strcmp(label, expected) == 0;
 }
 
 static bool formula_store_validate_formula_common(const formula_info_t *formula, const char *list_name, int index)
@@ -361,7 +402,7 @@ static void formula_store_canonicalize_water_formula(formula_info_t *formula)
     formula->formula_id = RECORD_ID_HOT_WATER_DEFAULT;
     formula->drink_id = DRINK_ID_WATER;
     formula->grind_range = 0U;
-    formula->grind_weight = 0U;
+    formula->grind_weight = 0.0f;
     formula->preset_temperature = 0U;
     formula->preset_liquid_weight = 0U;
     formula->milk_temperature = 0U;
@@ -409,8 +450,17 @@ static void formula_store_normalize_formula_item(formula_info_t *formula, bool i
         snprintf(formula->label, sizeof(formula->label), "%s", FORMULA_LABEL_DEFAULT);
     }
 
-    if (formula_store_requires_ai_label_id(formula) && formula->label_id == 0U) {
+    if (formula_store_label_equals(formula->label, FORMULA_LABEL_DEFAULT) &&
+        formula->label_id == 0) {
         formula->label_id = FORMULA_STORE_DEFAULT_LABEL_ID;
+    }
+
+    if (formula_store_label_equals(formula->label, FORMULA_LABEL_AI) &&
+        formula->label_id == 0) {
+        ESP_LOGW(TAG,
+                 "AI formula missing labelId, keep as 0 recordId=%lu formulaId=%lu",
+                 (unsigned long)formula->record_id,
+                 (unsigned long)formula->formula_id);
     }
 
     if (is_player_formula) {
@@ -543,9 +593,18 @@ static void formula_store_apply_settings_to_formula(formula_info_t *formula, con
         return;
     }
 
+    if (formula_store_label_equals(formula->label, FORMULA_LABEL_DEFAULT) &&
+        formula->label_id != FORMULA_STORE_DEFAULT_LABEL_ID) {
+        ESP_LOGI(TAG,
+                 "Local formula edit clears AI-linked labelId, drinkId=%u oldLabelId=%d",
+                 (unsigned)formula->drink_id,
+                 (int)formula->label_id);
+        formula->label_id = FORMULA_STORE_DEFAULT_LABEL_ID;
+    }
+
     switch (formula->drink_id) {
     case DRINK_ID_ESPRESSO:
-        formula->grind_weight = (uint16_t)(settings->grind_w + 0.5f);
+        formula->grind_weight = settings->grind_w;
         formula->preset_temperature = (uint16_t)(settings->esp_brew_t + 0.5f);
         formula->preset_liquid_weight = (uint16_t)(settings->esp_brew_w + 0.5f);
         formula->water_temperature = 0U;
@@ -554,7 +613,7 @@ static void formula_store_apply_settings_to_formula(formula_info_t *formula, con
         break;
 
     case DRINK_ID_AMERICAN:
-        formula->grind_weight = (uint16_t)(settings->grind_w + 0.5f);
+        formula->grind_weight = settings->grind_w;
         formula->preset_temperature = (uint16_t)(settings->ame_brew_t + 0.5f);
         formula->preset_liquid_weight = (uint16_t)(settings->ame_brew_w + 0.5f);
         formula->water_temperature = (uint16_t)(settings->ame_water_t + 0.5f);
@@ -563,7 +622,7 @@ static void formula_store_apply_settings_to_formula(formula_info_t *formula, con
         break;
 
     case DRINK_ID_COLDBREW:
-        formula->grind_weight = (uint16_t)(settings->grind_w + 0.5f);
+        formula->grind_weight = settings->grind_w;
         formula->preset_temperature = 0U;
         formula->preset_liquid_weight = (uint16_t)(settings->cold_brew_w + 0.5f);
         formula->water_temperature = 0U;
@@ -572,7 +631,7 @@ static void formula_store_apply_settings_to_formula(formula_info_t *formula, con
         break;
 
     case DRINK_ID_WATER:
-        formula->grind_weight = 0U;
+        formula->grind_weight = 0.0f;
         formula->grind_range = 0U;
         formula->preset_temperature = 0U;
         formula->preset_liquid_weight = 0U;
@@ -824,17 +883,18 @@ static bool formula_store_is_local_coffee_drink(uint8_t drink_id)
 
 static void formula_store_apply_local_grind_to_overall(formula_overall_t *overall, float grind_w)
 {
-    uint16_t grind_weight;
-
     if (!overall || !overall->formula_intel_list || grind_w <= 0.0f) {
         return;
     }
 
-    grind_weight = (uint16_t)(grind_w + 0.5f);
     for (int i = 0; i < overall->formula_intel_list_count; i++) {
         formula_info_t *formula = &overall->formula_intel_list[i];
         if (formula_store_is_local_coffee_drink(formula->drink_id)) {
-            formula->grind_weight = grind_weight;
+            formula->grind_weight = grind_w;
+            if (formula_store_label_equals(formula->label, FORMULA_LABEL_DEFAULT) &&
+                formula->label_id != FORMULA_STORE_DEFAULT_LABEL_ID) {
+                formula->label_id = FORMULA_STORE_DEFAULT_LABEL_ID;
+            }
         }
     }
 }
@@ -1086,6 +1146,7 @@ static bool formula_store_update_cache_from_payload(const char *payload, size_t 
 static bool formula_store_write_payload_to_nvs(const char *payload, size_t len, int version, bool force_update)
 {
     nvs_handle_t nvs_handle;
+    formula_store_save_ctx_t save_ctx;
     esp_err_t err;
     uint32_t crc32;
 
@@ -1094,6 +1155,11 @@ static bool formula_store_write_payload_to_nvs(const char *payload, size_t len, 
     }
 
     crc32 = formula_store_calc_crc32(payload, len);
+    save_ctx.payload = payload;
+    save_ctx.len = len;
+    save_ctx.version = version;
+    save_ctx.force_update = force_update;
+    save_ctx.crc32 = crc32;
 
     err = formula_store_open_namespace(false, NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK) {
@@ -1103,18 +1169,26 @@ static bool formula_store_write_payload_to_nvs(const char *payload, size_t len, 
         return false;
     }
 
-    err = nvs_set_i32(nvs_handle, FORMULA_STORE_KEY_VERSION, version);
-    if (err == ESP_OK) {
-        err = nvs_set_u8(nvs_handle, FORMULA_STORE_KEY_FORCE_UPD, force_update ? 1U : 0U);
-    }
-    if (err == ESP_OK) {
-        err = nvs_set_blob(nvs_handle, FORMULA_STORE_KEY_PAYLOAD, payload, len);
-    }
-    if (err == ESP_OK) {
-        err = nvs_set_u32(nvs_handle, FORMULA_STORE_KEY_PAYLOAD_CRC, crc32);
-    }
+    err = formula_store_write_payload_to_nvs_retry(nvs_handle, &save_ctx);
     if (err == ESP_OK) {
         err = nvs_commit(nvs_handle);
+    }
+
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        static const char *const keys[] = {
+            FORMULA_STORE_KEY_VERSION,
+            FORMULA_STORE_KEY_FORCE_UPD,
+            FORMULA_STORE_KEY_PAYLOAD,
+            FORMULA_STORE_KEY_PAYLOAD_CRC,
+        };
+        err = nvs_retry_rewrite_after_erasing_keys(nvs_handle,
+                                                   err,
+                                                   TAG,
+                                                   "formula payload",
+                                                   keys,
+                                                   sizeof(keys) / sizeof(keys[0]),
+                                                   formula_store_write_payload_to_nvs_retry,
+                                                   &save_ctx);
     }
 
     nvs_close(nvs_handle);
@@ -1503,9 +1577,23 @@ bool formula_store_set_force_update(bool force_update)
         return false;
     }
 
-    err = nvs_set_u8(nvs_handle, FORMULA_STORE_KEY_FORCE_UPD, force_update ? 1U : 0U);
+    err = formula_store_write_force_update_to_nvs(nvs_handle, &force_update);
     if (err == ESP_OK) {
         err = nvs_commit(nvs_handle);
+    }
+
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        static const char *const keys[] = {
+            FORMULA_STORE_KEY_FORCE_UPD,
+        };
+        err = nvs_retry_rewrite_after_erasing_keys(nvs_handle,
+                                                   err,
+                                                   TAG,
+                                                   "formula forceUpdate",
+                                                   keys,
+                                                   sizeof(keys) / sizeof(keys[0]),
+                                                   formula_store_write_force_update_to_nvs,
+                                                   &force_update);
     }
     nvs_close(nvs_handle);
 

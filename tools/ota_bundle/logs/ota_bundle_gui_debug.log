@@ -133,3 +133,189 @@
 [2026-04-24 13:28:07.941] Invoke-BundleTool exe=d:\Tools\esp\python_env\idf5.2_py3.11_env\Scripts\python.exe
 [2026-04-24 13:28:07.947] Invoke-BundleTool arguments="E:\Project\SP-Pro-ESP32\tools\ota_bundle\pack_ota_bundle.py" "pack" "--out" "E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.3_hmi_0.0.5_20260424_132806.bin" "--align" "4096" "--ctr" "E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.3.bin" "--ctr-version" "0.0.3" "--esp32" "E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.5.bin" "--esp32-version" "0.0.5"
 [2026-04-24 13:28:08.099] packRun done ok
+[2026-04-27 14:48:38.696] launch build=2026-04-08.2
+[2026-04-27 14:49:14.921] browse click ctxNull=False
+[2026-04-27 14:49:14.926] browse mode=file targetNull=False
+[2026-04-27 14:49:18.159] packCtr TextChanged
+[2026-04-27 14:49:18.160] Invoke-UpdatePackDefaultsSafe
+[2026-04-27 14:49:18.187] Update-PackDefaults enter ctrNull=False ctrVerNull=False espNull=False espVerNull=False outNull=False
+[2026-04-27 14:49:18.191] Update-PackDefaults paths ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.4.bin esp=
+[2026-04-27 14:49:18.204] CTR version guess=0.0.4
+[2026-04-27 14:49:18.221] default bundle path=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.4_20260427_144918.bin
+[2026-04-27 14:49:18.224] Update-PackDefaults leave ok
+[2026-04-27 14:49:18.224] browse selected file=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.4.bin
+[2026-04-27 14:49:19.151] browse click ctxNull=False
+[2026-04-27 14:49:19.152] browse mode=file targetNull=False
+[2026-04-27 14:49:20.976] packEsp TextChanged
+[2026-04-27 14:49:20.976] Invoke-UpdatePackDefaultsSafe
+[2026-04-27 14:49:20.977] Update-PackDefaults enter ctrNull=False ctrVerNull=False espNull=False espVerNull=False outNull=False
+[2026-04-27 14:49:20.978] Update-PackDefaults paths ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.4.bin esp=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.5.bin
+[2026-04-27 14:49:20.979] ESP version guess=0.0.5
+[2026-04-27 14:49:20.981] default bundle path=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.4_hmi_0.0.5_20260427_144920.bin
+[2026-04-27 14:49:20.982] Update-PackDefaults leave ok
+[2026-04-27 14:49:20.984] browse selected file=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.5.bin
+[2026-04-27 14:49:22.577] packRun click start
+[2026-04-27 14:49:22.578] packRun values ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.4.bin ctrVer=0.0.4 esp=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.5.bin espVer=0.0.5 out=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.4_hmi_0.0.5_20260427_144920.bin info=
+[2026-04-27 14:49:22.580] packRun args=pack | --out | E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.4_hmi_0.0.5_20260427_144920.bin | --align | 4096 | --ctr | E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.4.bin | --ctr-version | 0.0.4 | --esp32 | E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.5.bin | --esp32-version | 0.0.5
+[2026-04-27 14:49:22.624] Invoke-BundleTool exe=d:\Tools\esp\python_env\idf5.2_py3.11_env\Scripts\python.exe
+[2026-04-27 14:49:22.625] Invoke-BundleTool arguments="E:\Project\SP-Pro-ESP32\tools\ota_bundle\pack_ota_bundle.py" "pack" "--out" "E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.4_hmi_0.0.5_20260427_144920.bin" "--align" "4096" "--ctr" "E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.4.bin" "--ctr-version" "0.0.4" "--esp32" "E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.5.bin" "--esp32-version" "0.0.5"
+[2026-04-27 14:49:22.756] packRun done ok
+[2026-04-28 13:29:58.639] launch build=2026-04-08.2
+[2026-04-28 13:30:00.606] browse click ctxNull=False
+[2026-04-28 13:30:00.611] browse mode=file targetNull=False
+[2026-04-28 13:30:04.364] packCtr TextChanged
+[2026-04-28 13:30:04.374] Invoke-UpdatePackDefaultsSafe
+[2026-04-28 13:30:04.398] Update-PackDefaults enter ctrNull=False ctrVerNull=False espNull=False espVerNull=False outNull=False
+[2026-04-28 13:30:04.408] Update-PackDefaults paths ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.5.bin esp=
+[2026-04-28 13:30:04.418] CTR version guess=0.0.5
+[2026-04-28 13:30:04.436] default bundle path=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.5_20260428_133004.bin
+[2026-04-28 13:30:04.445] Update-PackDefaults leave ok
+[2026-04-28 13:30:04.445] browse selected file=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.5.bin
+[2026-04-28 13:30:05.233] browse click ctxNull=False
+[2026-04-28 13:30:05.235] browse mode=file targetNull=False
+[2026-04-28 13:30:07.858] packEsp TextChanged
+[2026-04-28 13:30:07.858] Invoke-UpdatePackDefaultsSafe
+[2026-04-28 13:30:07.858] Update-PackDefaults enter ctrNull=False ctrVerNull=False espNull=False espVerNull=False outNull=False
+[2026-04-28 13:30:07.858] Update-PackDefaults paths ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.5.bin esp=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.6.bin
+[2026-04-28 13:30:07.858] ESP version guess=0.0.6
+[2026-04-28 13:30:07.858] default bundle path=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.5_hmi_0.0.6_20260428_133007.bin
+[2026-04-28 13:30:07.864] Update-PackDefaults leave ok
+[2026-04-28 13:30:07.865] browse selected file=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.6.bin
+[2026-04-28 13:30:08.902] packRun click start
+[2026-04-28 13:30:08.912] packRun values ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.5.bin ctrVer=0.0.5 esp=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.6.bin espVer=0.0.6 out=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.5_hmi_0.0.6_20260428_133007.bin info=
+[2026-04-28 13:30:08.913] packRun args=pack | --out | E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.5_hmi_0.0.6_20260428_133007.bin | --align | 4096 | --ctr | E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.5.bin | --ctr-version | 0.0.5 | --esp32 | E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.6.bin | --esp32-version | 0.0.6
+[2026-04-28 13:30:08.929] Invoke-BundleTool exe=d:\Tools\esp\python_env\idf5.2_py3.11_env\Scripts\python.exe
+[2026-04-28 13:30:08.929] Invoke-BundleTool arguments="E:\Project\SP-Pro-ESP32\tools\ota_bundle\pack_ota_bundle.py" "pack" "--out" "E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.5_hmi_0.0.6_20260428_133007.bin" "--align" "4096" "--ctr" "E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.5.bin" "--ctr-version" "0.0.5" "--esp32" "E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.6.bin" "--esp32-version" "0.0.6"
+[2026-04-28 13:30:09.096] packRun done ok
+[2026-04-29 13:06:37.932] launch build=2026-04-08.2
+[2026-04-29 13:06:39.675] browse click ctxNull=False
+[2026-04-29 13:06:39.678] browse mode=file targetNull=False
+[2026-04-29 13:06:42.735] packCtr TextChanged
+[2026-04-29 13:06:42.737] Invoke-UpdatePackDefaultsSafe
+[2026-04-29 13:06:42.769] Update-PackDefaults enter ctrNull=False ctrVerNull=False espNull=False espVerNull=False outNull=False
+[2026-04-29 13:06:42.776] Update-PackDefaults paths ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.6.bin esp=
+[2026-04-29 13:06:42.795] CTR version guess=0.0.6
+[2026-04-29 13:06:42.816] default bundle path=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.6_20260429_130642.bin
+[2026-04-29 13:06:42.819] Update-PackDefaults leave ok
+[2026-04-29 13:06:42.820] browse selected file=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.6.bin
+[2026-04-29 13:06:43.608] browse click ctxNull=False
+[2026-04-29 13:06:43.609] browse mode=file targetNull=False
+[2026-04-29 13:06:45.524] packEsp TextChanged
+[2026-04-29 13:06:45.525] Invoke-UpdatePackDefaultsSafe
+[2026-04-29 13:06:45.526] Update-PackDefaults enter ctrNull=False ctrVerNull=False espNull=False espVerNull=False outNull=False
+[2026-04-29 13:06:45.527] Update-PackDefaults paths ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.6.bin esp=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.7.bin
+[2026-04-29 13:06:45.528] ESP version guess=0.0.7
+[2026-04-29 13:06:45.530] default bundle path=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.6_hmi_0.0.7_20260429_130645.bin
+[2026-04-29 13:06:45.531] Update-PackDefaults leave ok
+[2026-04-29 13:06:45.531] browse selected file=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.7.bin
+[2026-04-29 13:06:46.579] packRun click start
+[2026-04-29 13:06:46.580] packRun values ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.6.bin ctrVer=0.0.6 esp=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.7.bin espVer=0.0.7 out=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.6_hmi_0.0.7_20260429_130645.bin info=
+[2026-04-29 13:06:46.582] packRun args=pack | --out | E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.6_hmi_0.0.7_20260429_130645.bin | --align | 4096 | --ctr | E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.6.bin | --ctr-version | 0.0.6 | --esp32 | E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.7.bin | --esp32-version | 0.0.7
+[2026-04-29 13:06:46.597] Invoke-BundleTool exe=d:\Tools\esp\python_env\idf5.2_py3.11_env\Scripts\python.exe
+[2026-04-29 13:06:46.599] Invoke-BundleTool arguments="E:\Project\SP-Pro-ESP32\tools\ota_bundle\pack_ota_bundle.py" "pack" "--out" "E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.6_hmi_0.0.7_20260429_130645.bin" "--align" "4096" "--ctr" "E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.6.bin" "--ctr-version" "0.0.6" "--esp32" "E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.7.bin" "--esp32-version" "0.0.7"
+[2026-04-29 13:06:46.717] packRun done ok
+[2026-04-29 13:08:54.464] launch build=2026-04-08.2
+[2026-04-29 13:08:56.016] browse click ctxNull=False
+[2026-04-29 13:08:56.020] browse mode=file targetNull=False
+[2026-04-29 13:08:58.893] packCtr TextChanged
+[2026-04-29 13:08:58.895] Invoke-UpdatePackDefaultsSafe
+[2026-04-29 13:08:58.925] Update-PackDefaults enter ctrNull=False ctrVerNull=False espNull=False espVerNull=False outNull=False
+[2026-04-29 13:08:58.929] Update-PackDefaults paths ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin esp=
+[2026-04-29 13:08:58.942] CTR version guess=0.0.7
+[2026-04-29 13:08:58.960] default bundle path=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.7_20260429_130858.bin
+[2026-04-29 13:08:58.963] Update-PackDefaults leave ok
+[2026-04-29 13:08:58.965] browse selected file=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin
+[2026-04-29 13:08:59.794] browse click ctxNull=False
+[2026-04-29 13:08:59.795] browse mode=file targetNull=False
+[2026-04-29 13:09:01.310] packEsp TextChanged
+[2026-04-29 13:09:01.311] Invoke-UpdatePackDefaultsSafe
+[2026-04-29 13:09:01.311] Update-PackDefaults enter ctrNull=False ctrVerNull=False espNull=False espVerNull=False outNull=False
+[2026-04-29 13:09:01.312] Update-PackDefaults paths ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin esp=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.8.bin
+[2026-04-29 13:09:01.313] ESP version guess=0.0.8
+[2026-04-29 13:09:01.315] default bundle path=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.7_hmi_0.0.8_20260429_130901.bin
+[2026-04-29 13:09:01.316] Update-PackDefaults leave ok
+[2026-04-29 13:09:01.318] browse selected file=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.8.bin
+[2026-04-29 13:09:02.310] packRun click start
+[2026-04-29 13:09:02.312] packRun values ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin ctrVer=0.0.7 esp=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.8.bin espVer=0.0.8 out=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.7_hmi_0.0.8_20260429_130901.bin info=
+[2026-04-29 13:09:02.316] packRun args=pack | --out | E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.7_hmi_0.0.8_20260429_130901.bin | --align | 4096 | --ctr | E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin | --ctr-version | 0.0.7 | --esp32 | E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.8.bin | --esp32-version | 0.0.8
+[2026-04-29 13:09:02.333] Invoke-BundleTool exe=d:\Tools\esp\python_env\idf5.2_py3.11_env\Scripts\python.exe
+[2026-04-29 13:09:02.334] Invoke-BundleTool arguments="E:\Project\SP-Pro-ESP32\tools\ota_bundle\pack_ota_bundle.py" "pack" "--out" "E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.7_hmi_0.0.8_20260429_130901.bin" "--align" "4096" "--ctr" "E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin" "--ctr-version" "0.0.7" "--esp32" "E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.8.bin" "--esp32-version" "0.0.8"
+[2026-04-29 13:09:02.446] packRun done ok
+[2026-04-29 16:32:04.943] launch build=2026-04-08.2
+[2026-04-29 16:32:07.346] browse click ctxNull=False
+[2026-04-29 16:32:07.351] browse mode=file targetNull=False
+[2026-04-29 16:32:13.692] packCtr TextChanged
+[2026-04-29 16:32:13.693] Invoke-UpdatePackDefaultsSafe
+[2026-04-29 16:32:13.720] Update-PackDefaults enter ctrNull=False ctrVerNull=False espNull=False espVerNull=False outNull=False
+[2026-04-29 16:32:13.724] Update-PackDefaults paths ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.6.bin esp=
+[2026-04-29 16:32:13.739] CTR version guess=0.0.6
+[2026-04-29 16:32:13.755] default bundle path=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.6_20260429_163213.bin
+[2026-04-29 16:32:13.757] Update-PackDefaults leave ok
+[2026-04-29 16:32:13.758] browse selected file=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.6.bin
+[2026-04-29 16:32:14.643] browse click ctxNull=False
+[2026-04-29 16:32:14.644] browse mode=file targetNull=False
+[2026-04-29 16:32:16.337] packEsp TextChanged
+[2026-04-29 16:32:16.338] Invoke-UpdatePackDefaultsSafe
+[2026-04-29 16:32:16.339] Update-PackDefaults enter ctrNull=False ctrVerNull=False espNull=False espVerNull=False outNull=False
+[2026-04-29 16:32:16.340] Update-PackDefaults paths ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.6.bin esp=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.7.bin
+[2026-04-29 16:32:16.342] ESP version guess=0.0.7
+[2026-04-29 16:32:16.344] default bundle path=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.6_hmi_0.0.7_20260429_163216.bin
+[2026-04-29 16:32:16.345] Update-PackDefaults leave ok
+[2026-04-29 16:32:16.346] browse selected file=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.7.bin
+[2026-04-29 16:32:17.134] packRun click start
+[2026-04-29 16:32:17.136] packRun values ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.6.bin ctrVer=0.0.6 esp=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.7.bin espVer=0.0.7 out=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.6_hmi_0.0.7_20260429_163216.bin info=
+[2026-04-29 16:32:17.137] packRun args=pack | --out | E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.6_hmi_0.0.7_20260429_163216.bin | --align | 4096 | --ctr | E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.6.bin | --ctr-version | 0.0.6 | --esp32 | E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.7.bin | --esp32-version | 0.0.7
+[2026-04-29 16:32:17.153] Invoke-BundleTool exe=d:\Tools\esp\python_env\idf5.2_py3.11_env\Scripts\python.exe
+[2026-04-29 16:32:17.155] Invoke-BundleTool arguments="E:\Project\SP-Pro-ESP32\tools\ota_bundle\pack_ota_bundle.py" "pack" "--out" "E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.6_hmi_0.0.7_20260429_163216.bin" "--align" "4096" "--ctr" "E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.6.bin" "--ctr-version" "0.0.6" "--esp32" "E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.7.bin" "--esp32-version" "0.0.7"
+[2026-04-29 16:32:17.274] packRun done ok
+[2026-04-29 16:32:51.437] browse click ctxNull=False
+[2026-04-29 16:32:51.438] browse mode=file targetNull=False
+[2026-04-29 16:32:56.726] packCtr TextChanged
+[2026-04-29 16:32:56.727] Invoke-UpdatePackDefaultsSafe
+[2026-04-29 16:32:56.727] Update-PackDefaults enter ctrNull=False ctrVerNull=False espNull=False espVerNull=False outNull=False
+[2026-04-29 16:32:56.729] Update-PackDefaults paths ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin esp=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.7.bin
+[2026-04-29 16:32:56.732] default bundle path=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.6_hmi_0.0.7_20260429_163256.bin
+[2026-04-29 16:32:56.735] Update-PackDefaults leave ok
+[2026-04-29 16:32:56.736] browse selected file=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin
+[2026-04-29 16:32:57.684] browse click ctxNull=False
+[2026-04-29 16:32:57.685] browse mode=file targetNull=False
+[2026-04-29 16:32:59.417] packEsp TextChanged
+[2026-04-29 16:32:59.418] Invoke-UpdatePackDefaultsSafe
+[2026-04-29 16:32:59.419] Update-PackDefaults enter ctrNull=False ctrVerNull=False espNull=False espVerNull=False outNull=False
+[2026-04-29 16:32:59.420] Update-PackDefaults paths ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin esp=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.8.bin
+[2026-04-29 16:32:59.421] default bundle path=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.6_hmi_0.0.7_20260429_163259.bin
+[2026-04-29 16:32:59.422] Update-PackDefaults leave ok
+[2026-04-29 16:32:59.422] browse selected file=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.8.bin
+[2026-04-29 16:33:00.717] packRun click start
+[2026-04-29 16:33:00.718] packRun values ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin ctrVer=0.0.6 esp=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.8.bin espVer=0.0.7 out=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.6_hmi_0.0.7_20260429_163259.bin info=
+[2026-04-29 16:33:00.720] packRun args=pack | --out | E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.6_hmi_0.0.7_20260429_163259.bin | --align | 4096 | --ctr | E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin | --ctr-version | 0.0.6 | --esp32 | E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.8.bin | --esp32-version | 0.0.7
+[2026-04-29 16:33:00.721] Invoke-BundleTool exe=d:\Tools\esp\python_env\idf5.2_py3.11_env\Scripts\python.exe
+[2026-04-29 16:33:00.722] Invoke-BundleTool arguments="E:\Project\SP-Pro-ESP32\tools\ota_bundle\pack_ota_bundle.py" "pack" "--out" "E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.6_hmi_0.0.7_20260429_163259.bin" "--align" "4096" "--ctr" "E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin" "--ctr-version" "0.0.6" "--esp32" "E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.8.bin" "--esp32-version" "0.0.7"
+[2026-04-29 16:33:00.824] packRun done ok
+[2026-04-29 16:33:28.090] launch build=2026-04-08.2
+[2026-04-29 16:33:29.534] browse click ctxNull=False
+[2026-04-29 16:33:29.537] browse mode=file targetNull=False
+[2026-04-29 16:33:43.583] packCtr TextChanged
+[2026-04-29 16:33:43.585] Invoke-UpdatePackDefaultsSafe
+[2026-04-29 16:33:43.609] Update-PackDefaults enter ctrNull=False ctrVerNull=False espNull=False espVerNull=False outNull=False
+[2026-04-29 16:33:43.613] Update-PackDefaults paths ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin esp=
+[2026-04-29 16:33:43.626] CTR version guess=0.0.7
+[2026-04-29 16:33:43.643] default bundle path=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.7_20260429_163343.bin
+[2026-04-29 16:33:43.647] Update-PackDefaults leave ok
+[2026-04-29 16:33:43.648] browse selected file=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin
+[2026-04-29 16:33:44.217] browse click ctxNull=False
+[2026-04-29 16:33:44.218] browse mode=file targetNull=False
+[2026-04-29 16:33:45.578] packEsp TextChanged
+[2026-04-29 16:33:45.579] Invoke-UpdatePackDefaultsSafe
+[2026-04-29 16:33:45.580] Update-PackDefaults enter ctrNull=False ctrVerNull=False espNull=False espVerNull=False outNull=False
+[2026-04-29 16:33:45.580] Update-PackDefaults paths ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin esp=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.8.bin
+[2026-04-29 16:33:45.581] ESP version guess=0.0.8
+[2026-04-29 16:33:45.585] default bundle path=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.7_hmi_0.0.8_20260429_163345.bin
+[2026-04-29 16:33:45.587] Update-PackDefaults leave ok
+[2026-04-29 16:33:45.588] browse selected file=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.8.bin
+[2026-04-29 16:33:46.564] packRun click start
+[2026-04-29 16:33:46.565] packRun values ctr=E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin ctrVer=0.0.7 esp=E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.8.bin espVer=0.0.8 out=E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.7_hmi_0.0.8_20260429_163345.bin info=
+[2026-04-29 16:33:46.566] packRun args=pack | --out | E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.7_hmi_0.0.8_20260429_163345.bin | --align | 4096 | --ctr | E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin | --ctr-version | 0.0.7 | --esp32 | E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.8.bin | --esp32-version | 0.0.8
+[2026-04-29 16:33:46.581] Invoke-BundleTool exe=d:\Tools\esp\python_env\idf5.2_py3.11_env\Scripts\python.exe
+[2026-04-29 16:33:46.583] Invoke-BundleTool arguments="E:\Project\SP-Pro-ESP32\tools\ota_bundle\pack_ota_bundle.py" "pack" "--out" "E:\Project\SP-Pro-ESP32\tools\after_package\ota_ctr_0.0.7_hmi_0.0.8_20260429_163345.bin" "--align" "4096" "--ctr" "E:\Project\SP-Pro-ESP32\tools\before_package\SP_CTR_APP_CRC_0.0.7.bin" "--ctr-version" "0.0.7" "--esp32" "E:\Project\SP-Pro-ESP32\tools\before_package\sp-pro-hmi_0.0.8.bin" "--esp32-version" "0.0.8"
+[2026-04-29 16:33:46.697] packRun done ok

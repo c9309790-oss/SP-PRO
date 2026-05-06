@@ -81,6 +81,35 @@ static void disp_set_all_unit_icons(disp_element_t *d, bool on)
     disp_set_s_indicator(d, BF_UNIT_S11, on, false);
 }
 
+static void disp_set_output_indicator(disp_element_t *d, bool coffee_outlet, bool hot_water_outlet)
+{
+    if (!d) {
+        return;
+    }
+
+    disp_set_s_indicator(d, BF_UNIT_S3, coffee_outlet, false);
+    disp_set_s_indicator(d, BF_UNIT_S4, hot_water_outlet, false);
+}
+
+static void disp_apply_temp_output_indicator(disp_element_t *d, encoder_mode_t mode)
+{
+    if (!d) {
+        return;
+    }
+
+    switch (mode) {
+    case ENCODER_MODE_ESP_BREW_TEMP:
+    case ENCODER_MODE_AME_BREW_TEMP:
+        disp_set_output_indicator(d, true, false);
+        break;
+    case ENCODER_MODE_HOT_WATER_TEMP:
+        disp_set_output_indicator(d, false, true);
+        break;
+    default:
+        break;
+    }
+}
+
 static void disp_apply_wifi_key_display(const app_display_view_t *view,
                                         disp_element_t *d,
                                         bool remote_blink)
@@ -238,6 +267,24 @@ static void disp_build_combo_select_page(const app_display_view_t *view,
     disp_apply_key_mode(view, d, KEY_MODE_COMBO_BLINK, selected_mask, blink_mask);
 }
 
+static void disp_apply_brew_plus_steam_keys(const app_display_view_t *view,
+                                            disp_element_t *d,
+                                            key_id_t drink_key)
+{
+    uint16_t full_mask = 0U;
+    uint16_t blink_mask = (uint16_t)(1U << drink_key);
+
+    if (view && view->drink.parallel_steam_active) {
+        if (view->drink.parallel_steam_preheating) {
+            blink_mask |= (uint16_t)(1U << BF_KEY_K5);
+        } else {
+            full_mask |= (uint16_t)(1U << BF_KEY_K5);
+        }
+    }
+
+    disp_apply_key_mode(view, d, KEY_MODE_COMBO_BLINK, full_mask, blink_mask);
+}
+
 static void disp_render_weight_param(const app_display_view_t *view,
                                      disp_element_t *d,
                                      const disp_param_desc_t *param_desc,
@@ -294,6 +341,7 @@ static void disp_render_temp_param(const app_display_view_t *view,
 
     (void)view;
     disp_show_temp(d, param_desc->pos, (uint8_t)(dynamic_value + 0.5f));
+    disp_apply_temp_output_indicator(d, param_desc->mode);
 }
 
 static void disp_render_number_param(const app_display_view_t *view,
@@ -443,23 +491,27 @@ void disp_build_power_on_page(const app_display_view_t *view, disp_element_t *d)
 
 void disp_build_preheat_page(const app_display_view_t *view, disp_element_t *d)
 {
+    bool suppress_marquee = false;
+
     if (!view || !d) {
         return;
     }
 
     disp_clear(d);
-    if (view->drink.remote_active) {
-        switch (view->drink.target_drink) {
-        case DRINK_ESPRESSO:
-        case DRINK_MASTER:
-            disp_apply_key_mode(view, d, KEY_MODE_SINGLE_BLINK, 0U, (uint16_t)(1U << BF_KEY_K1));
-            break;
-        case DRINK_AMERICANO:
-            disp_apply_key_mode(view, d, KEY_MODE_SINGLE_BLINK, 0U, (uint16_t)(1U << BF_KEY_K2));
-            break;
-        default:
-            break;
-        }
+    switch (view->drink.target_drink) {
+    case DRINK_ESPRESSO:
+    case DRINK_MASTER:
+        suppress_marquee = true;
+        disp_apply_brew_plus_steam_keys(view, d, BF_KEY_K1);
+        break;
+
+    case DRINK_AMERICANO:
+        suppress_marquee = true;
+        disp_apply_brew_plus_steam_keys(view, d, BF_KEY_K2);
+        break;
+
+    default:
+        break;
     }
     disp_set_main_indicators(
         d,
@@ -471,6 +523,7 @@ void disp_build_preheat_page(const app_display_view_t *view, disp_element_t *d)
     switch (view->drink.target_drink) {
     case DRINK_ESPRESSO:
     case DRINK_MASTER:
+        disp_set_output_indicator(d, true, view->drink.parallel_steam_active);
         if (view->drink.remote_active) {
             disp_show_weight_with_unit(d,
                                        BF_POS_LEFT,
@@ -487,6 +540,7 @@ void disp_build_preheat_page(const app_display_view_t *view, disp_element_t *d)
 
     case DRINK_AMERICANO:
         disp_set_l_indicator(d, BF_INDICATOR_L2, WHITE_LIGHT_FULL);
+        disp_set_output_indicator(d, true, true);
         if (view->drink.remote_active) {
             disp_show_weight_with_unit(d,
                                        BF_POS_LEFT,
@@ -520,7 +574,7 @@ void disp_build_preheat_page(const app_display_view_t *view, disp_element_t *d)
 
     if (view->drink.remote_active && view->drink.countdown_seconds > 0U) {
         disp_show_time_s(d, view->drink.countdown_seconds);
-    } else {
+    } else if (!view->drink.parallel_steam_active && !suppress_marquee) {
         disp_preheat_marquee(d, view->anim_step);
     }
 
@@ -548,13 +602,14 @@ void disp_build_espresso_brew_page(const app_display_view_t *view, disp_element_
     }
 
     disp_clear(d);
-    disp_apply_key_mode(view, d, KEY_MODE_SINGLE_BLINK, 0, (uint16_t)(1U << drink_key));
+    disp_apply_brew_plus_steam_keys(view, d, drink_key);
     disp_set_main_indicators(
         d,
         WHITE_LIGHT_FULL,
         WHITE_LIGHT_OFF,
         WHITE_LIGHT_FULL,
         WHITE_LIGHT_OFF);
+    disp_set_output_indicator(d, true, view->drink.parallel_steam_active);
 
     display_temp = (view->drink.remote_active && view->drink.target_temp > 0.0f) ?
                    (uint8_t)(view->drink.target_temp + 0.5f) :
@@ -577,16 +632,18 @@ void disp_build_cold_brew_prepare_page(const app_display_view_t *view, disp_elem
     }
 
     disp_clear(d);
-    disp_apply_key_mode(view, d,
-                        view->drink.remote_active ? KEY_MODE_SINGLE_BLINK : KEY_MODE_SINGLE,
-                        view->drink.remote_active ? 0U : (uint16_t)(1U << BF_KEY_K3),
-                        view->drink.remote_active ? (uint16_t)(1U << BF_KEY_K3) : 0U);
+    if (view->drink.parallel_steam_active || view->drink.remote_active) {
+        disp_apply_brew_plus_steam_keys(view, d, BF_KEY_K3);
+    } else {
+        disp_apply_key_mode(view, d, KEY_MODE_SINGLE, (uint16_t)(1U << BF_KEY_K3), 0U);
+    }
     disp_set_main_indicators(
         d,
         WHITE_LIGHT_FULL,
         WHITE_LIGHT_OFF,
         WHITE_LIGHT_FULL,
         WHITE_LIGHT_OFF);
+    disp_set_output_indicator(d, true, view->drink.parallel_steam_active);
     disp_show_weight(d, BF_POS_LEFT, view->drink.target_ml, view->drink.target_ml);
     if (view->drink.remote_active && view->drink.countdown_seconds > 0U) {
         disp_show_time_s(d, view->drink.countdown_seconds);
@@ -602,13 +659,14 @@ void disp_build_cold_brew_page(const app_display_view_t *view, disp_element_t *d
     }
 
     disp_clear(d);
-    disp_apply_key_mode(view, d, KEY_MODE_SINGLE_BLINK, 0, (uint16_t)(1U << BF_KEY_K3));
+    disp_apply_brew_plus_steam_keys(view, d, BF_KEY_K3);
     disp_set_main_indicators(
         d,
         WHITE_LIGHT_FULL,
         WHITE_LIGHT_OFF,
         WHITE_LIGHT_FULL,
         WHITE_LIGHT_OFF);
+    disp_set_output_indicator(d, true, view->drink.parallel_steam_active);
 
     disp_show_time_s(d, (uint16_t)view->drink.elapsed_tick);
     disp_show_pressure_bar(d, view->ms.pressure, PRESSURE_MAX_VAL);
@@ -636,9 +694,11 @@ void disp_build_water_prepare_page(const app_display_view_t *view, disp_element_
         WHITE_LIGHT_OFF,
         WHITE_LIGHT_FULL,
         WHITE_LIGHT_OFF);
+    disp_set_output_indicator(d, false, true);
     disp_set_s_indicator(d, BF_UNIT_S1, true, false);
 
     disp_show_temp(d, BF_POS_LEFT, (uint8_t)(view->drink.target_temp + 0.5f));
+    disp_set_output_indicator(d, false, true);
     disp_show_weight(d, BF_POS_LEFT, view->drink.target_ml, view->drink.target_ml);
     if (view->drink.remote_active && view->drink.countdown_seconds > 0U) {
         disp_show_time_s(d, view->drink.countdown_seconds);
@@ -663,6 +723,7 @@ void disp_build_water_page(const app_display_view_t *view, disp_element_t *d, ke
         WHITE_LIGHT_OFF,
         WHITE_LIGHT_FULL,
         WHITE_LIGHT_OFF);
+    disp_set_output_indicator(d, false, true);
     disp_set_s_indicator(d, BF_UNIT_S1, true, false);
 
     if (drink_key == BF_KEY_K2) {
@@ -677,6 +738,7 @@ void disp_build_water_page(const app_display_view_t *view, disp_element_t *d, ke
                        view->ms.hot_current_temp;
     }
     disp_show_temp(d, BF_POS_LEFT, display_temp);
+    disp_set_output_indicator(d, false, true);
     disp_show_weight_progress_stable(d,
                                      BF_POS_LEFT,
                                      view->drink.display_liquid_ml,
@@ -749,6 +811,13 @@ void disp_build_clear_bean_page(const app_display_view_t *view, disp_element_t *
     disp_apply_key_mode(view, d, KEY_MODE_SINGLE_BLINK, 0U, blink_mask);
     disp_set_l_indicator(d, BF_INDICATOR_L4, WHITE_LIGHT_FULL);
 
+    if (view->clear_bean.step == CLEAR_BEAN_STEP_WAIT_RUN_DELAY &&
+        view->clear_bean.countdown_seconds > 0U) {
+        disp_show_weight(d, BF_POS_LEFT, (float)view->clear_bean.countdown_seconds, 10.0f);
+        disp_set_s_indicator(d, BF_UNIT_S1, false, false);
+        disp_set_s_indicator(d, BF_UNIT_S2, false, false);
+    }
+
     if (view->clear_bean.step == CLEAR_BEAN_STEP_RUNNING ||
         view->clear_bean.step == CLEAR_BEAN_STEP_DONE) {
         disp_show_grind_w(d, view->ms.powder_weight, view->setting.grind_w);
@@ -758,6 +827,7 @@ void disp_build_clear_bean_page(const app_display_view_t *view, disp_element_t *
 static void disp_setting_espresso(const app_display_view_t *view, disp_element_t *d)
 {
     disp_build_setting_header(view, d, BF_KEY_K1, false);
+    disp_set_output_indicator(d, true, false);
     disp_show_weight_with_unit(d,
                                BF_POS_LEFT,
                                view->setting.esp_brew_w,
@@ -770,6 +840,7 @@ static void disp_setting_espresso(const app_display_view_t *view, disp_element_t
 static void disp_setting_america(const app_display_view_t *view, disp_element_t *d)
 {
     disp_build_setting_header(view, d, BF_KEY_K2, true);
+    disp_set_output_indicator(d, true, true);
     disp_show_weight_with_unit(d,
                                BF_POS_LEFT,
                                view->setting.ame_brew_w,
@@ -788,6 +859,7 @@ static void disp_setting_america(const app_display_view_t *view, disp_element_t 
 static void disp_setting_coldbrew(const app_display_view_t *view, disp_element_t *d)
 {
     disp_build_setting_header(view, d, BF_KEY_K3, false);
+    disp_set_output_indicator(d, true, false);
     disp_show_weight_with_unit(d,
                                BF_POS_LEFT,
                                view->setting.cold_brew_w,
@@ -799,12 +871,14 @@ static void disp_setting_coldbrew(const app_display_view_t *view, disp_element_t
 static void disp_setting_water(const app_display_view_t *view, disp_element_t *d)
 {
     disp_build_setting_header(view, d, BF_KEY_K4, false);
+    disp_set_output_indicator(d, false, true);
     disp_show_weight_with_unit(d,
                                BF_POS_LEFT,
                                view->setting.hot_water_w,
                                view->setting.hot_water_w,
                                disp_use_scale_unit(view));
     disp_show_temp(d, BF_POS_LEFT, (uint8_t)(view->setting.hot_water_t + 0.5f));
+    disp_set_output_indicator(d, false, true);
     disp_render_current_param(view, d);
 }
 
@@ -979,17 +1053,17 @@ void disp_build_calibration_page(const app_display_view_t *view, disp_element_t 
 
     switch (view->calibration.mode) {
     case CAL_MODE_HOT_DRINK:
-        disp_show_flow_coeff(d,
-                             BF_POS_LEFT,
-                             view->calibration.flow_coeff_current,
-                             view->calibration.flow_adjust_percent);
+        disp_show_cup_calibration(d,
+                                  BF_POS_LEFT,
+                                  view->calibration.flow_coeff_current,
+                                  view->calibration.flow_adjust_percent);
         break;
 
     case CAL_MODE_HOT_WATER:
-        disp_show_flow_coeff(d,
-                             BF_POS_RIGHT,
-                             view->calibration.flow_coeff_current,
-                             view->calibration.flow_adjust_percent);
+        disp_show_cup_calibration(d,
+                                  BF_POS_RIGHT,
+                                  view->calibration.flow_coeff_current,
+                                  view->calibration.flow_adjust_percent);
         break;
 
     case CAL_MODE_NONE:
@@ -1026,11 +1100,16 @@ void disp_build_detection_page(const app_display_view_t *view, disp_element_t *d
     disp_clear(d);
     disp_set_main_indicators(
         d,
-        WHITE_LIGHT_HALF,
-        WHITE_LIGHT_HALF,
+        WHITE_LIGHT_OFF,
+        WHITE_LIGHT_OFF,
         WHITE_LIGHT_HALF,
         WHITE_LIGHT_HALF);
-    disp_apply_key_mode(view, d, KEY_MODE_ALL_OFF, 0U, 0U);
+    for (int i = 0; i < BF_KEY_COUNT; i++) {
+        disp_set_key_icon(d, i, WHITE_LIGHT_HALF);
+        if (i <= BF_KEY_K5) {
+            disp_set_key_text(d, i, WHITE_LIGHT_HALF);
+        }
+    }
 
     switch (view->detection.step) {
     case DET_STEP_PLACE_PORTAFILTER:
@@ -1048,6 +1127,8 @@ void disp_build_detection_page(const app_display_view_t *view, disp_element_t *d
         break;
 
     case DET_STEP_REMOVE_WATER_TANK:
+        disp_set_key_icon(d, BF_KEY_K1, WHITE_LIGHT_HALF);
+        disp_set_key_text(d, BF_KEY_K1, WHITE_LIGHT_HALF);
         disp_set_key_icon(d, BF_KEY_K2, view->ms.water_box_shortage_flag ? WHITE_LIGHT_HALF : WHITE_LIGHT_FULL);
         disp_set_key_text(d, BF_KEY_K2, view->ms.water_box_shortage_flag ? WHITE_LIGHT_HALF : WHITE_LIGHT_FULL);
         break;
@@ -1090,6 +1171,8 @@ void disp_build_detection_page(const app_display_view_t *view, disp_element_t *d
         break;
 
     case DET_STEP_REMOVE_PORTAFILTER_FINAL:
+        disp_set_key_icon(d, BF_KEY_K5, WHITE_LIGHT_HALF);
+        disp_set_key_text(d, BF_KEY_K5, WHITE_LIGHT_HALF);
         break;
 
     case DET_STEP_PASS:
@@ -1438,7 +1521,8 @@ void disp_build_lock_page(const app_display_view_t *view, disp_element_t *d)
     if (view->child_lock.ui_hint == DISP_CHILD_LOCKED) {
         disp_apply_key_mode(view, d, KEY_MODE_SINGLE_BLINK, 0, (uint16_t)(1U << BF_KEY_K8));
     } else if (view->child_lock.ui_hint == DISP_CHILD_UNLOCK) {
-        disp_apply_key_mode(view, d, KEY_MODE_CHILD_LOCK, 0, 0);
+        disp_set_key_icon(d, BF_KEY_K8, WHITE_LIGHT_HALF);
+        disp_set_key_text(d, BF_KEY_K8, WHITE_LIGHT_HALF);
     }
 }
 

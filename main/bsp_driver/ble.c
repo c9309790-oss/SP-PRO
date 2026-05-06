@@ -25,6 +25,7 @@
 #include "mqtt.h"
 #include "ble_pairing.h"
 #include "ble.h"
+#include "nvs_retry.h"
 #include "ram_diag.h"
 #include "system_runtime.h"
 #include "uart_hmi.h"
@@ -43,6 +44,22 @@
 #define PREPARE_BUF_MAX_SIZE        1024
 #define CHAR_DECLARATION_SIZE       (sizeof(uint8_t))
 
+typedef struct {
+    const char *key;
+    const char *value;
+} ble_nvs_save_ctx_t;
+
+static esp_err_t ble_write_string_to_nvs(nvs_handle_t nvs_handle, void *ctx)
+{
+    const ble_nvs_save_ctx_t *save_ctx = (const ble_nvs_save_ctx_t *)ctx;
+
+    if (!save_ctx || !save_ctx->key || !save_ctx->value) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return nvs_set_str(nvs_handle, save_ctx->key, save_ctx->value);
+}
+
 
 #define ADV_CONFIG_FLAG             (1 << 0)
 #define SCAN_RSP_CONFIG_FLAG        (1 << 1)
@@ -60,34 +77,51 @@ static const char *TAG = "ble";
 
 static void ble_build_expected_name(char *ble_name, size_t ble_name_size)
 {
+    static const char prefix[] = "KF-SA01C-WCC-";
     size_t client_id_len;
+    size_t prefix_len;
+    const char *suffix;
+    size_t suffix_len;
 
     if (!ble_name || ble_name_size == 0U) {
         return;
     }
 
     ble_name[0] = '\0';
+    prefix_len = strlen(prefix);
     client_id_len = strlen(mqtt_config.client_id);
     if (client_id_len == 0U) {
         snprintf(ble_name, ble_name_size, "%s", "KF-SA01C-WCC-0407");
         return;
     }
 
-    if ((strlen("KF-SA01C-WCC-") + client_id_len) < ble_name_size) {
-        snprintf(ble_name, ble_name_size, "%s%s", "KF-SA01C-WCC-", mqtt_config.client_id);
-        return;
-    }
-
     if (client_id_len >= 4U) {
-        snprintf(ble_name,
-                 ble_name_size,
-                 "%s%s",
-                 "KF-SA01C-WCC-",
-                 mqtt_config.client_id + client_id_len - 4U);
+        suffix = mqtt_config.client_id + client_id_len - 4U;
+        suffix_len = 4U;
+    } else {
+        suffix = mqtt_config.client_id;
+        suffix_len = client_id_len;
+    }
+
+    if ((prefix_len + client_id_len) < ble_name_size) {
+        suffix = mqtt_config.client_id;
+        suffix_len = client_id_len;
+    }
+
+    if (ble_name_size <= prefix_len) {
+        memcpy(ble_name, prefix, ble_name_size - 1U);
+        ble_name[ble_name_size - 1U] = '\0';
         return;
     }
 
-    snprintf(ble_name, ble_name_size, "%s%s", "KF-SA01C-WCC-", mqtt_config.client_id);
+    memcpy(ble_name, prefix, prefix_len);
+    ble_name[prefix_len] = '\0';
+
+    if (suffix_len > (ble_name_size - prefix_len - 1U)) {
+        suffix_len = ble_name_size - prefix_len - 1U;
+    }
+    memcpy(ble_name + prefix_len, suffix, suffix_len);
+    ble_name[prefix_len + suffix_len] = '\0';
 }
 
 static void ble_log_memory_snapshot(const char *phase)
@@ -756,25 +790,39 @@ void read_ble_name_from_nvs(char *ble_name) {
 
 void save_ble_name_to_nvs(char *ble_name) {
     nvs_handle_t nvs_handle;
+    ble_nvs_save_ctx_t save_ctx = {
+        .key = "ble_name",
+        .value = ble_name,
+    };
     esp_err_t err = nvs_open("NVS_BLE_CONFIG", NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Error (%s) opening NVS handle", esp_err_to_name(err));
         return;
     }
 
-    err = nvs_set_str(nvs_handle, "ble_name", ble_name);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error (%s) setting ble name in NVS", esp_err_to_name(err));
-        nvs_close(nvs_handle);
-        return;
+    err = ble_write_string_to_nvs(nvs_handle, &save_ctx);
+
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
     }
 
-    err = nvs_commit(nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error (%s) committing changes to NVS", esp_err_to_name(err));
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        static const char *const keys[] = { "ble_name" };
+        err = nvs_retry_rewrite_after_erasing_keys(nvs_handle,
+                                                   err,
+                                                   TAG,
+                                                   "ble name",
+                                                   keys,
+                                                   sizeof(keys) / sizeof(keys[0]),
+                                                   ble_write_string_to_nvs,
+                                                   &save_ctx);
     }
 
     nvs_close(nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error (%s) saving ble name to NVS", esp_err_to_name(err));
+        return;
+    }
     ESP_LOGI(TAG, "ble name saved to NVS %s", ble_name);
 }
 
@@ -800,25 +848,39 @@ void read_ble_on_off_from_nvs(char *ble_on_off) {
 
 void save_ble_on_off_to_nvs(char *ble_on_off) {
     nvs_handle_t nvs_handle;
+    ble_nvs_save_ctx_t save_ctx = {
+        .key = "ble_on_off",
+        .value = ble_on_off,
+    };
     esp_err_t err = nvs_open("NVS_BLE_CONFIG", NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Error (%s) opening NVS handle", esp_err_to_name(err));
         return;
     }
 
-    err = nvs_set_str(nvs_handle, "ble_on_off", ble_on_off);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error (%s) setting ble name in NVS", esp_err_to_name(err));
-        nvs_close(nvs_handle);
-        return;
+    err = ble_write_string_to_nvs(nvs_handle, &save_ctx);
+
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
     }
 
-    err = nvs_commit(nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error (%s) committing changes to NVS", esp_err_to_name(err));
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        static const char *const keys[] = { "ble_on_off" };
+        err = nvs_retry_rewrite_after_erasing_keys(nvs_handle,
+                                                   err,
+                                                   TAG,
+                                                   "ble on_off",
+                                                   keys,
+                                                   sizeof(keys) / sizeof(keys[0]),
+                                                   ble_write_string_to_nvs,
+                                                   &save_ctx);
     }
 
     nvs_close(nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error (%s) saving ble on_off to NVS", esp_err_to_name(err));
+        return;
+    }
     strcpy(ble_on_off_str, ble_on_off);
     ESP_LOGI(TAG, "ble on_off saved to NVS %s", ble_on_off);
 }
@@ -845,25 +907,39 @@ void read_ble_pin_on_off_from_nvs(char *ble_pin_on_off) {
 }
 void save_ble_pin_on_off_to_nvs(char *ble_pin_on_off) {
     nvs_handle_t nvs_handle;
+    ble_nvs_save_ctx_t save_ctx = {
+        .key = "ble_pin_on_off",
+        .value = ble_pin_on_off,
+    };
     esp_err_t err = nvs_open("NVS_BLE_CONFIG", NVS_READWRITE, &nvs_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Error (%s) opening NVS handle", esp_err_to_name(err));
         return;
     }
 
-    err = nvs_set_str(nvs_handle, "ble_pin_on_off", ble_pin_on_off);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error (%s) setting ble name in NVS", esp_err_to_name(err));
-        nvs_close(nvs_handle);
-        return;
+    err = ble_write_string_to_nvs(nvs_handle, &save_ctx);
+
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
     }
 
-    err = nvs_commit(nvs_handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Error (%s) committing changes to NVS", esp_err_to_name(err));
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        static const char *const keys[] = { "ble_pin_on_off" };
+        err = nvs_retry_rewrite_after_erasing_keys(nvs_handle,
+                                                   err,
+                                                   TAG,
+                                                   "ble pin on_off",
+                                                   keys,
+                                                   sizeof(keys) / sizeof(keys[0]),
+                                                   ble_write_string_to_nvs,
+                                                   &save_ctx);
     }
 
     nvs_close(nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error (%s) saving ble pin on_off to NVS", esp_err_to_name(err));
+        return;
+    }
     strcpy(ble_pin_on_off_str, ble_pin_on_off);
     ESP_LOGI(TAG, "ble ble_pin_on_off saved to NVS %s", ble_pin_on_off);
 }

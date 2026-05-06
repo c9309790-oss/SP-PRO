@@ -1,0 +1,14 @@
+/build
+/esp-idf/
+*.obj
+/sdkconfig.bak
+/tmp_*
+/tools/after_package/
+/tools/before_package/
+/tools/ota_bundle/logs/
+/tools/factory_tooling/factory_toolkit/factory_cfg_out/
+/tools/factory_tooling/factory_toolkit/logs/
+/*.lock
+*.pdf
+/*.pdf
+doc

@@ -30,9 +30,11 @@ set(SERVICE_SOURCES
     "service/ctr_scheduler.c"
     "service/device_statistics_store.c"
     "service/drink_record_service.c"
+    "service/extraction_curve_service.c"
     "service/event_record_service.c"
     "service/formula_store.c"
     "service/led_service.c"
+    "service/nvs_retry.c"
     "service/ram_diag.c"
 )
 
@@ -40,6 +42,7 @@ set(PROTOCOL_SOURCES
     "sp_protocol/mqtt_protocol.c"
     "sp_protocol/mqtt_protocol_control.c"
     "sp_protocol/mqtt_protocol_core.c"
+    "sp_protocol/mqtt_protocol_curve.c"
     "sp_protocol/mqtt_protocol_formula.c"
     "sp_protocol/mqtt_protocol_ota.c"
     "sp_protocol/mqtt_protocol_resource.c"

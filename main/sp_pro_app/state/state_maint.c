@@ -168,7 +168,7 @@ static app_state_t maint_finish_flow(app_ctx_t *ctx,
     int cleaning_mode = maint_state_to_cleaning_mode(maintain_state);
 
     VOICE_PLAY_ONCE(finish_voice);
-    device_statistics_notify_maintain_success(maintain_state);
+    device_statistics_notify_maintain_success(maintain_state, ctx ? ctx->setting.clean_v : 0.0f);
     if (cleaning_mode >= 0) {
         mqtt_notify_clean_result_complete(cleaning_mode);
     }
@@ -241,7 +241,7 @@ app_state_t state_handle_clean_brew(app_ctx_t *ctx)
         break;
 
     case MAINT_CLEAN_SUB_FINISH:
-        device_statistics_notify_maintain_success(ST_MAINT_BREW);
+        device_statistics_notify_maintain_success(ST_MAINT_BREW, ctx->setting.clean_v);
         mqtt_notify_clean_result_complete(CLEANING_MODE_BREW);
         event_record_publish_brew_cleaning((int)(ctx->setting.clean_v + 0.5f));
         voice_manager_play_touch_tone();
@@ -721,6 +721,7 @@ app_state_t state_handle_maint_drain(app_ctx_t *ctx)
     case CLEAR_STEP_CLEARING:
         if (maint_wait_clean_finish(ctx, step_tick)) {
             event_record_publish_empty_water((int)(ctx->setting.clean_v + 0.5f));
+            mqtt_notify_remote_controller_complete(SETTING_TYPE_CLEAR_WATERWAY, true);
             ctx->setting.clear_step = CLEAR_STEP_CLEARING_DONE;
             *finish_voice_count = 0;
             *step_tick = ctx->timer.tick;

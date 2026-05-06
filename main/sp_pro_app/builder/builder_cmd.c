@@ -17,7 +17,7 @@ static const char *TAG = "cmd_builder";
 extern FLASH_FACTORY_DATA factory_data;
 
 #define FACTORY_WRITE_MODEL_FALLBACK      "SP_PRO"
-#define FACTORY_WRITE_MAINS_FREQ_FALLBACK 50
+#define FACTORY_WRITE_MAINS_FREQ_FALLBACK FACTORY_MAINS_PROFILE_220V_50HZ_CCC
 #define FACTORY_WRITE_LIQUID_SCALE_ENABLED 0
 #define FACTORY_WRITE_MAX_ABS_FLOAT       1000000.0f
 #define FACTORY_WRITE_FLOWMETER_DEFAULT   0.45f
@@ -178,7 +178,7 @@ static int formula_stage_pressure_value(const formula_info_t *formula, int index
     }
 
     if (index < formula->pressure_stage_cnt && formula->pressure_stage[index].pressure > 0) {
-        return formula->pressure_stage[index].pressure;
+        return (int)(formula->pressure_stage[index].pressure + 0.5f);
     }
 
     return 9;
@@ -515,7 +515,7 @@ static bool fmt_mqtt_grind_start(const app_command_view_t *view, char *buf, uint
         return false;
     }
 
-    target_weight = (formula->grind_weight > 0U) ? (int)formula->grind_weight : 0;
+    target_weight = (formula->grind_weight > 0.0f) ? (int)(formula->grind_weight + 0.5f) : 0;
     return snprintf(buf, len,
                     "123@RUN@GRIND=0,%d,0#123",
                     target_weight) > 0;
@@ -654,10 +654,11 @@ static bool fmt_factory_write(const app_command_view_t *view, char *buf, uint16_
         ESP_LOGW(TAG, "factory write missing model_name, fallback to %s", model);
     }
 
-    if (mains_frequency <= 0) {
+    if (mains_frequency < FACTORY_MAINS_PROFILE_220V_50HZ_CCC ||
+        mains_frequency > FACTORY_MAINS_PROFILE_120V_60HZ_UL) {
         factory_data.mains_frequency = FACTORY_WRITE_MAINS_FREQ_FALLBACK;
         mains_frequency = factory_data.mains_frequency;
-        ESP_LOGW(TAG, "factory write missing mains_frequency, fallback to %d", mains_frequency);
+        ESP_LOGW(TAG, "factory write missing mains_profile, fallback to %d", mains_frequency);
     }
 
     if (!factory_write_float_valid(factory_data.powder_k_value)) {
@@ -674,18 +675,22 @@ static bool fmt_factory_write(const app_command_view_t *view, char *buf, uint16_
     }
 
 #if !FACTORY_WRITE_LIQUID_SCALE_ENABLED
+    if (factory_data.liquid_k_value != 0.0f || factory_data.liquid_b_value != 0.0f) {
+        ESP_LOGI(TAG,
+                 "factory write override liquid coeffs to defaults liquid_k=0 liquid_b=0");
+    }
     factory_data.liquid_k_value = 0.0f;
     factory_data.liquid_b_value = 0.0f;
 #endif
 
     if (!factory_write_float_valid(factory_data.flowmeter_coff) ||
-        factory_data.flowmeter_coff <= 0.0f) {
-        ESP_LOGW(TAG,
-                 "factory write missing flowmeter_coff=%.8g, fallback to %.2f",
+        factory_data.flowmeter_coff != FACTORY_WRITE_FLOWMETER_DEFAULT) {
+        ESP_LOGI(TAG,
+                 "factory write override flowmeter_coff %.8g -> %.2f",
                  (double)factory_data.flowmeter_coff,
                  (double)FACTORY_WRITE_FLOWMETER_DEFAULT);
-        factory_data.flowmeter_coff = FACTORY_WRITE_FLOWMETER_DEFAULT;
     }
+    factory_data.flowmeter_coff = FACTORY_WRITE_FLOWMETER_DEFAULT;
 
     if (!ctr_factory_data_is_valid(&factory_data, reason, sizeof(reason))) {
         ESP_LOGE(TAG,
@@ -877,5 +882,3 @@ bool ctr_cmd_param(encoder_mode_t mode)
     ESP_LOGI(TAG, "[CTRL][PARAM] mode=%d cmd=%s", mode, cmd_buf);
     return true;
 }
-
-

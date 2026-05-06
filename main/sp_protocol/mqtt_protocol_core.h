@@ -25,6 +25,7 @@ void mqtt_add_sub_topic(cJSON *data, const char *sub_topic);
 void mqtt_publish_json_root(cJSON *root);
 
 int json_get_int(cJSON *obj, const char *key, int def);
+float json_get_float(cJSON *obj, const char *key, float def);
 const char *json_get_string(cJSON *obj, const char *key, const char *def);
 cJSON *json_get_object(cJSON *obj, const char *key);
 cJSON *json_get_array(cJSON *obj, const char *key);
@@ -40,6 +41,7 @@ bool mqtt_has_ota_message(cJSON *data);
 
 bool mqtt_handle_ota_data_from_mqtt(const char *msg_id, cJSON *data);
 bool mqtt_handle_formula_ack_data_from_mqtt(cJSON *data);
+bool mqtt_handle_extraction_curve_ack_data_from_mqtt(cJSON *data);
 bool mqtt_handle_formula_setting_data_from_mqtt(const char *msg_id, cJSON *data);
 bool mqtt_parse_player_formula_from_json(cJSON *param, formula_info_t *formula);
 bool mqtt_handle_resource_data_from_mqtt(cJSON *data);

@@ -34,7 +34,7 @@ static void parse_pressure_param(cJSON *param, formula_info_t *formula)
     for (int i = 0; i < formula->pressure_stage_cnt; i++)
     {
         cJSON *item = cJSON_GetArrayItem(arr, i);
-        formula->pressure_stage[i].pressure = json_get_int(item, "pressure", 0);
+        formula->pressure_stage[i].pressure = json_get_float(item, "pressure", 0.0f);
         formula->pressure_stage[i].wait_time = json_get_int(item, "waitTime", 0);
     }
 }
@@ -78,7 +78,7 @@ static bool mqtt_parse_formula_from_json_ex(cJSON *param, formula_info_t *formul
     formula->label_id = json_get_int(param, "labelId", 0);
     strncpy(formula->label, json_get_string(param, "label", ""), sizeof(formula->label) - 1);
     formula->grind_range = json_get_int(param, "grindRange", 0);
-    formula->grind_weight = json_get_int(param, "grindWeight", 0);
+    formula->grind_weight = json_get_float(param, "grindWeight", 0.0f);
     formula->preset_temperature = json_get_int(param, "presetTemperature", 0);
     formula->preset_liquid_weight = json_get_int(param, "presetLiquidWeight", 0);
     formula->water_temperature = json_get_int(param, "waterTemperature", 0);
@@ -310,8 +310,15 @@ static bool mqtt_parse_formula_overall_setting_from_mqtt(const char *msg_id, cJS
 
     ESP_LOGI(TAG, "formulaOverallAck ackCode=%d msg=%s version=%d", ack_result.ack_code, ack_result.msg, formula_overall.version);
     publish_formula_overall_ack_to_mqtt(msg_id ? msg_id : "0", ack_result.ack_code, ack_result.msg);
-    if (ack_result.ack_code == 0)
-        mqtt_report_device_status();
+    if (ack_result.ack_code == 0) {
+        ESP_LOGI(TAG, "queue formulaOverall status report after setting apply");
+        mqtt_set_next_formula_overall_report_msg_id(msg_id ? msg_id : "0");
+        if (!mqtt_schedule_device_status_sections_report(MQTT_DEVICE_STATUS_SECTION_FORMULA_OVERALL,
+                                                         "formula_overall_setting",
+                                                         0U)) {
+            mqtt_set_next_formula_overall_report_msg_id(NULL);
+        }
+    }
 
     mqtt_free_formula_overall(&formula_overall);
     return true;
